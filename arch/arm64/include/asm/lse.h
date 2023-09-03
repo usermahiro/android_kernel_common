@@ -16,12 +16,12 @@
 #include <asm/atomic_lse.h>
 #include <asm/cpucaps.h>
 
-#define __lse_ll_sc_body(op, ...)					\
-({									\
-	alternative_has_cap_likely(ARM64_HAS_LSE_ATOMICS) ?		\
-		__lse_##op(__VA_ARGS__) :				\
-		__ll_sc_##op(__VA_ARGS__);				\
-})
+/*
+ * The target CPU is known to implement LSE atomics, so use them
+ * unconditionally. This removes the LL/SC fallback from the generated
+ * code and reduces the instruction cache footprint.
+ */
+#define __lse_ll_sc_body(op, ...)	__lse_##op(__VA_ARGS__)
 
 /* In-line patching at runtime */
 #define ARM64_LSE_ATOMIC_INSN(llsc, lse)				\
