@@ -2031,6 +2031,12 @@ static struct ctl_table kern_table[] = {
 #endif
 };
 
+int vm_kcompressd = 24;
+/* kcompressd-unofficial FIFO depth ceiling; mirrors KCOMPRESS_FIFO_SIZE
+ * in mm/swap.h (kept as a local literal here since that header is
+ * mm/-internal and not meant to be included from kernel/sysctl.c). */
+static int SYSCTL_KCOMPRESS_FIFO_SIZE = 256;
+
 static struct ctl_table vm_table[] = {
 	{
 		.procname	= "overcommit_memory",
@@ -2040,6 +2046,15 @@ static struct ctl_table vm_table[] = {
 		.proc_handler	= overcommit_policy_handler,
 		.extra1		= SYSCTL_ZERO,
 		.extra2		= SYSCTL_TWO,
+	},
+	{
+		.procname	= "kcompressd",
+		.data		= &vm_kcompressd,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler = proc_dointvec_minmax,
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= &SYSCTL_KCOMPRESS_FIFO_SIZE,
 	},
 	{
 		.procname	= "overcommit_ratio",
