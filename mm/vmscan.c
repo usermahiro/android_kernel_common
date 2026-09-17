@@ -7599,6 +7599,8 @@ unsigned long shrink_all_memory(unsigned long nr_to_reclaim)
 void __meminit kswapd_run(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
+	struct kcompressd_pgdat *kc;
+	int ret;
 
 	pgdat_kswapd_lock(pgdat);
 	if (!pgdat->kswapd) {
@@ -7610,7 +7612,52 @@ void __meminit kswapd_run(int nid)
 			BUG_ON(system_state < SYSTEM_RUNNING);
 			pgdat->kswapd = NULL;
 		}
+
+		/*
+		 * kcompressd-unofficial: its state lives out-of-line behind
+		 * pgdat->kcompressd_ext so pg_data_t's layout stays KMI-stable
+		 * (see include/linux/mmzone.h). Allocated here rather than in
+		 * pgdat_init_internals(), which runs too early in boot for
+		 * GFP_KERNEL. Failure here is non-fatal: kswapd keeps working,
+		 * we just fall back to synchronous swapout.
+		 */
+		kc = pgdat->kcompressd_ext;
+		if (!kc) {
+			kc = kzalloc(sizeof(*kc), GFP_KERNEL);
+			if (!kc) {
+				pr_err("%s: fail to allocate kcompressd state\n",
+						__func__);
+				goto out;
+			}
+			init_waitqueue_head(&kc->wait);
+			spin_lock_init(&kc->fifo_lock);
+			pgdat->kcompressd_ext = kc;
+		}
+
+		if (kc->task)
+			goto out;
+
+		ret = kfifo_alloc(&kc->fifo,
+				KCOMPRESS_FIFO_SIZE * sizeof(struct folio *),
+				GFP_KERNEL);
+		if (ret) {
+			pr_err("%s: fail to kfifo_alloc\n", __func__);
+			goto out;
+		}
+
+		printk(KERN_INFO "Kcompressd-Unofficial 0.5 by Masahito Suzuki (forked from Kcompressd by Qun-Wei Lin from MediaTek)");
+		kc->task = kthread_create_on_node(kcompressd, pgdat, nid,
+				"kcompressd%d", nid);
+		if (IS_ERR(kc->task)) {
+			pr_err("Failed to start kcompressd on node %d，ret=%ld\n",
+					nid, PTR_ERR(kc->task));
+			kc->task = NULL;
+			kfifo_free(&kc->fifo);
+		} else {
+			wake_up_process(kc->task);
+		}
 	}
+out:
 	pgdat_kswapd_unlock(pgdat);
 }
 
@@ -7621,6 +7668,7 @@ void __meminit kswapd_run(int nid)
 void __meminit kswapd_stop(int nid)
 {
 	pg_data_t *pgdat = NODE_DATA(nid);
+	struct kcompressd_pgdat *kc;
 	struct task_struct *kswapd;
 
 	pgdat_kswapd_lock(pgdat);
@@ -7628,6 +7676,12 @@ void __meminit kswapd_stop(int nid)
 	if (kswapd) {
 		kthread_stop(kswapd);
 		pgdat->kswapd = NULL;
+	}
+	kc = pgdat->kcompressd_ext;
+	if (kc && kc->task) {
+		kthread_stop(kc->task);
+		kc->task = NULL;
+		kfifo_free(&kc->fifo);
 	}
 	pgdat_kswapd_unlock(pgdat);
 }

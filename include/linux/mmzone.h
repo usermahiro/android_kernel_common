@@ -1316,6 +1316,10 @@ struct deferred_split {
 };
 #endif
 
+/* Defined in mm/swap.h; out-of-line kcompressd-unofficial state, see
+ * pg_data_t's ANDROID_KABI_USE(1, ...) below. */
+struct kcompressd_pgdat;
+
 #ifdef CONFIG_MEMORY_FAILURE
 /*
  * Per NUMA node memory failure handling statistics.
@@ -1490,7 +1494,16 @@ typedef struct pglist_data {
 	struct memory_failure_stats mf_stats;
 #endif
 
-	ANDROID_KABI_RESERVE(1);
+	/*
+	 * KMI-safe out-of-line storage for kcompressd-unofficial state
+	 * (wait queue, kthread, FIFO). Kept behind this KABI_USE pointer
+	 * instead of inlining the fields directly, so pg_data_t's layout
+	 * and every field's offset below this point stay unchanged for
+	 * KMI/vendor-module compatibility. See mm/swap.h for the struct
+	 * definition and mm/vmscan.c (kswapd_run/kswapd_stop) for
+	 * allocation/teardown.
+	 */
+	ANDROID_KABI_USE(1, struct kcompressd_pgdat *kcompressd_ext);
 	ANDROID_BACKPORT_RESERVE(1);
 	ANDROID_OEM_DATA(1);
 } pg_data_t;

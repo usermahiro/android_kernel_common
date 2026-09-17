@@ -7,6 +7,9 @@ struct mempolicy;
 #ifdef CONFIG_SWAP
 #include <linux/swapops.h> /* for swp_offset */
 #include <linux/blk_types.h> /* for bio_end_io_t */
+#include <linux/kfifo.h> /* for struct kfifo in kcompressd_pgdat */
+#include <linux/wait.h>  /* for wait_queue_head_t */
+#include <linux/spinlock.h>
 
 /* linux/mm/page_io.c */
 int sio_pool_init(void);
@@ -21,6 +24,21 @@ static inline void swap_read_unplug(struct swap_iocb *plug)
 void swap_write_unplug(struct swap_iocb *sio);
 int swap_writepage(struct page *page, struct writeback_control *wbc);
 void __swap_writepage(struct folio *folio, struct writeback_control *wbc);
+
+/*
+ * kcompressd-unofficial: KMI-safe out-of-line state hung off
+ * pg_data_t->kcompressd_ext (see include/linux/mmzone.h). Allocated
+ * in mm/vmscan.c:kswapd_run(), freed alongside kswapd in
+ * kswapd_stop().
+ */
+struct kcompressd_pgdat {
+	wait_queue_head_t	wait;
+	struct task_struct	*task;
+	struct kfifo		fifo;
+	spinlock_t		fifo_lock;
+};
+#define KCOMPRESS_FIFO_SIZE 256
+int kcompressd(void *p);
 
 /* linux/mm/swap_state.c */
 /* One swap address space for each 64M swap space */
@@ -142,6 +160,11 @@ static inline struct folio *swapin_readahead(swp_entry_t swp, gfp_t gfp_mask,
 }
 
 static inline int swap_writepage(struct page *p, struct writeback_control *wbc)
+{
+	return 0;
+}
+
+static inline int kcompressd(void *p)
 {
 	return 0;
 }
