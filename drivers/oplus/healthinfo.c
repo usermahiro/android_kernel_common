@@ -41,6 +41,8 @@ EXPORT_SYMBOL_GPL(is_fg);
 static DEFINE_MUTEX(cpu_load_lock);
 static unsigned long last_load_jiffies;
 static int cached_load;
+static struct cpu_load_sample prev_sample;
+static bool has_prev_sample;
 
 struct cpu_load_sample {
 	u64 t_user;
@@ -492,6 +494,11 @@ int __init oplus_healthinfo_init(void)
 	if (fg_info_dir) {
 		proc_create("fg_uids", 0666, fg_info_dir, &proc_fg_uids_fops);
 	}
+
+	/* Initialize baseline CPU load sample */
+	get_cpu_sample(&prev_sample);
+	last_load_jiffies = jiffies;
+	has_prev_sample = true;
 
 	pr_info("healthinfo: OPLUS healthinfo interfaces initialized successfully\n");
 	return 0;
