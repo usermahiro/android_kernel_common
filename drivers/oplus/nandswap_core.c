@@ -61,6 +61,12 @@
 #include <linux/pagewalk.h>
 #endif
 #include "nandswap.h"
+#include <linux/pgtable.h>
+#include <linux/huge_mm.h>
+#include <linux/mmap_lock.h>
+#include <linux/page-flags.h>
+#include <linux/sched/signal.h>
+#include <linux/sched/task.h>
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
 #define walk_page_range_hook(mm, start, end, walk, rp) \
@@ -69,6 +75,33 @@
 #define walk_page_range_hook(mm, start, end, walk, rp) \
 	walk_page_range(start, end, walk)
 #endif
+
+
+/*
+ * 6.12 port helpers
+ *
+ * swap_address_space() lives in mm/swap.h (private) in 6.12, so mirror it here.
+ * swapper_spaces[] is a non-static global in mm/swap_state.c.
+ */
+extern struct address_space *swapper_spaces[];
+#ifndef SWAP_ADDRESS_SPACE_SHIFT
+#define SWAP_ADDRESS_SPACE_SHIFT	14
+#endif
+static inline struct address_space *ns_swap_address_space(swp_entry_t entry)
+{
+	return &swapper_spaces[swp_type(entry)]
+			      [swp_offset(entry) >> SWAP_ADDRESS_SPACE_SHIFT];
+}
+
+/*
+ * isolate_lru_page() is gone in 6.12; folio_isolate_lru() is the replacement.
+ * VERIFY in mm/vmscan.c: if folio_isolate_lru() returns 0 on success (int),
+ * keep "!"; if it returns bool true on success, drop the "!".
+ */
+static inline bool ns_isolate_folio(struct folio *folio)
+{
+	return !folio_isolate_lru(folio);
+}
 
 #define RD_SIZE 128
 #define DEBUG_TIME_INFO 0
@@ -233,7 +266,7 @@ static inline struct ns_task_struct *ns_task_insert(pid_t pid, int type)
 
 	ntask->pid = pid;
 	ntask->state = NS_OUT_STANDBY;
-	ntask->lock = __SPIN_LOCK_UNLOCKED(lock);
+	spin_lock_init(&ntask->lock);
 	ntask->type = type;
 	ntask->timeout = jiffies;
 	ntask->retry = 0;
@@ -377,9 +410,9 @@ static void enqueue_reclaim_data(pid_t nr, struct reclaim_info *info)
 	waken_task = (info == &out_info ? nswapoutd : nswapind);
 	if (!waken_task)
 		return;
-	if (waken_task->state == TASK_INTERRUPTIBLE)
-		wake_up_process(waken_task);
-	if (nswapdropd->state == TASK_INTERRUPTIBLE)
+	/* wake_up_process() is a no-op if the task is already running */
+	wake_up_process(waken_task);
+	if (nswapdropd)
 		wake_up_process(nswapdropd);
 }
 
@@ -459,6 +492,7 @@ static ssize_t swapin_anon(struct task_struct *task)
 {
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
+	struct vma_iterator vmi;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	struct mm_walk walk = {};
 #else
@@ -482,9 +516,10 @@ retry:
 	walk.pmd_entry = swapin_walk_pmd_entry;
 #endif
 
-	down_read(&mm->mmap_lock);
+	mmap_write_lock(mm);
 
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+	vma_iter_init(&vmi, mm, 0);
+	for_each_vma(vmi, vma) {
 		if (vma->vm_flags & VM_NANDSWAP)
 			continue;
 
@@ -504,11 +539,11 @@ retry:
 					   &walk, vma);
 		if (err == -1)
 			break;
-		vma->vm_flags |= VM_NANDSWAP;
+		vm_flags_set(vma, VM_NANDSWAP);
 	}
 
 	flush_tlb_mm(mm);
-	up_read(&mm->mmap_lock);
+	mmap_write_unlock(mm);
 	mmput(mm);
 	if (err) {
 		err = 0;
@@ -518,8 +553,7 @@ out:
 	lru_add_drain();
 
 #ifdef CONFIG_OPLUS_NANDSWAP_DEBUG
-	pr_info("in %s (pid %d) (size %d-%d)
-",
+	pr_info("in %s (pid %d) (size %d-%d)\n",
 		task->comm, task->pid, task_anon, task_swap);
 #endif
 
@@ -563,8 +597,8 @@ static int swapind_fn(void *p)
 			put_task_struct(task);
 		}
 
-		set_current_state(TASK_INTERRUPTIBLE);
-		freezable_schedule();
+		set_current_state(TASK_INTERRUPTIBLE | TASK_FREEZABLE);
+		schedule();
 
 		if (kthread_should_stop())
 			break;
@@ -578,27 +612,32 @@ static int ns_reclaim_pte(pmd_t *pmd, unsigned long addr,
 {
 	struct ns_reclaim_param *rp = walk->private;
 	struct vm_area_struct *vma = rp->vma;
-	pte_t *pte, ptent;
+	pte_t *start_pte, *pte, ptent;
 	spinlock_t *ptl;
-	struct page *page;
+	struct folio *folio;
 	LIST_HEAD(page_list);
 	int isolated;
 	int reclaimed = 0;
 	int reclaim_type = rp->type;
 
-	split_huge_pmd(vma, addr, pmd);
-	if (pmd_trans_unstable(pmd) || !rp->nr_to_reclaim)
+	if (!rp->nr_to_reclaim)
 		return 0;
+
+	split_huge_pmd(vma, pmd, addr);
 cont:
 	isolated = 0;
-	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+	/* returns NULL if the pmd is huge/none/changed under us */
+	start_pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+	if (!start_pte)
+		return 0;
+	pte = start_pte;
 	for (; addr != end; pte++, addr += PAGE_SIZE) {
-		ptent = *pte;
+		ptent = ptep_get(pte);
 		if (!pte_present(ptent))
 			continue;
 
-		page = vm_normal_page(vma, addr, ptent);
-		if (!page)
+		folio = vm_normal_folio(vma, addr, ptent);
+		if (!folio || folio_test_large(folio))
 			continue;
 
 		/*
@@ -606,33 +645,34 @@ cont:
 		 * Only taking care of mapcount == 1 is good enough.
 		 */
 
-		if (PageActive(page)) {
+		if (folio_test_active(folio)) {
 			rp->nr_act++;
 			if (reclaim_type == NS_TYPE_NAND_ACT)
 				continue;
 		} else
 			rp->nr_inact++;
 
-		if (isolate_lru_page(page))
+		if (!ns_isolate_folio(folio))
 			continue;
 
-		if (PageAnon(page) && !PageSwapBacked(page)) {
-			putback_lru_page(page);
+		if (folio_test_anon(folio) && !folio_test_swapbacked(folio)) {
+			folio_putback_lru(folio);
 			continue;
 		}
 
-		list_add(&page->lru, &page_list);
-#ifdef CONFIG_OPLUS_SYSTEM_KERNEL_QCOM
-		inc_node_page_state(page, NR_ISOLATED_ANON +
-				page_is_file_cache(page));
-#endif
+		list_add(&folio->lru, &page_list);
+		node_stat_mod_folio(folio, NR_ISOLATED_ANON +
+				    folio_is_file_lru(folio),
+				    folio_nr_pages(folio));
 		isolated++;
 		rp->nr_scanned++;
 
-		if ((isolated >= SWAP_CLUSTER_MAX) || !rp->nr_to_reclaim)
+		if ((isolated >= SWAP_CLUSTER_MAX) || !rp->nr_to_reclaim) {
+			addr += PAGE_SIZE;
 			break;
+		}
 	}
-	pte_unmap_unlock(pte - 1, ptl);
+	pte_unmap_unlock(start_pte, ptl);
 
 	if (reclaim_type == NS_TYPE_NAND_ACT || reclaim_type == NS_TYPE_NAND_ALL)
 		reclaimed = nswap_reclaim_page_list(&page_list, vma, true);
@@ -654,6 +694,7 @@ static ssize_t reclaim_anon(struct task_struct *task)
 {
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
+	struct vma_iterator vmi;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	struct mm_walk reclaim_walk = {};
 #else
@@ -680,8 +721,7 @@ static ssize_t reclaim_anon(struct task_struct *task)
 	spin_lock(&ntask->lock);
 	if (ntask->state != NS_OUT_QUEUE) {
 #ifdef CONFIG_OPLUS_NANDSWAP_DEBUG
-		pr_info("exit reclaim
-");
+		pr_info("exit reclaim\n");
 #endif
 		spin_unlock(&ntask->lock);
 		goto out;
@@ -711,8 +751,9 @@ static ssize_t reclaim_anon(struct task_struct *task)
 	reclaim_walk.pmd_entry = ns_reclaim_pte;
 #endif
 
-	down_read(&mm->mmap_lock);
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+	mmap_write_lock(mm);
+	vma_iter_init(&vmi, mm, 0);
+	for_each_vma(vmi, vma) {
 		if (is_vm_hugetlb_page(vma))
 			continue;
 
@@ -728,21 +769,20 @@ static ssize_t reclaim_anon(struct task_struct *task)
 		rp.vma = vma;
 		walk_page_range_hook(mm, vma->vm_start, vma->vm_end,
 				     &reclaim_walk, &rp);
-		vma->vm_flags &= ~VM_NANDSWAP;
+		vm_flags_clear(vma, VM_NANDSWAP);
 		if (!rp.nr_to_reclaim)
 			break;
 	}
 
 	flush_tlb_mm(mm);
-	up_read(&mm->mmap_lock);
+	mmap_write_unlock(mm);
 #ifdef CONFIG_OPLUS_NANDSWAP_DEBUG
 	a_task_anon = get_mm_counter(mm, MM_ANONPAGES);
 	a_task_swap = get_mm_counter(mm, MM_SWAPENTS);
 #endif
 	mmput(mm);
 #ifdef CONFIG_OPLUS_NANDSWAP_DEBUG
-	pr_info("out %s (pid %d) (size %d-%d to %d-%d) scan %d cache %d active %d inactive %d
-",
+	pr_info("out %s (pid %d) (size %d-%d to %d-%d) scan %d cache %d active %d inactive %d\n",
 		task->comm, task->pid, task_anon, task_swap,
 		a_task_anon, a_task_swap,
 		rp.nr_scanned, rp.nr_reclaimed, rp.nr_act, rp.nr_inact);
@@ -777,7 +817,7 @@ static int swapoutd_fn(void *p)
 
 			do {
 				msleep(30);
-			} while (nswapind && (nswapind->state == TASK_RUNNING));
+			} while (nswapind && task_is_running(nswapind));
 
 			reclaim_anon(task);
 			enqueue_reclaim_data(task->pid, &drop_info);
@@ -785,8 +825,8 @@ static int swapoutd_fn(void *p)
 		}
 
 		ns_life_ctrl_update(false);
-		set_current_state(TASK_INTERRUPTIBLE);
-		freezable_schedule();
+		set_current_state(TASK_INTERRUPTIBLE | TASK_FREEZABLE);
+		schedule();
 
 		if (kthread_should_stop())
 			break;
@@ -800,23 +840,21 @@ static int drop_swapcache_pte(pmd_t *pmd, unsigned long start,
 {
 	struct ns_reclaim_param *rp = walk->private;
 	struct vm_area_struct *vma = rp->vma;
-	pte_t *orig_pte;
 	unsigned long index;
 	LIST_HEAD(page_list);
 	int reclaimed = 0;
 
-	if (pmd_none_or_trans_huge_or_clear_bad(pmd))
-		return 0;
-
 	for (index = start; index != end; index += PAGE_SIZE) {
-		pte_t pte;
+		pte_t pte, *orig_pte;
 		spinlock_t *ptl;
 		swp_entry_t entry;
-		struct address_space *swapper_space;
-		struct page *page = NULL;
+		struct folio *folio;
 
-		orig_pte = pte_offset_map_lock(vma->vm_mm, pmd, start, &ptl);
-		pte = *(orig_pte + ((index - start) / PAGE_SIZE));
+		/* NULL: huge/none/bad pmd, nothing to do for this range */
+		orig_pte = pte_offset_map_lock(vma->vm_mm, pmd, index, &ptl);
+		if (!orig_pte)
+			break;
+		pte = ptep_get(orig_pte);
 		pte_unmap_unlock(orig_pte, ptl);
 
 		if (pte_present(pte) || pte_none(pte))
@@ -825,28 +863,27 @@ static int drop_swapcache_pte(pmd_t *pmd, unsigned long start,
 		entry = pte_to_swp_entry(pte);
 		if (unlikely(non_swap_entry(entry)))
 			continue;
-		swapper_space = swap_address_space(entry);
-		page = find_get_page(swapper_space, swp_offset(entry));
-		if (!page)
-			continue;
-		put_page(page);
 
-		if (page_count(page) > 1)
+		folio = filemap_get_folio(ns_swap_address_space(entry),
+					  swp_offset(entry));
+		if (IS_ERR_OR_NULL(folio))
 			continue;
-		if (isolate_lru_page(page))
+		folio_put(folio);
+
+		if (folio_ref_count(folio) > 1 || folio_test_large(folio))
+			continue;
+		if (!ns_isolate_folio(folio))
 			continue;
 
-		if (PageAnon(page) && !PageSwapBacked(page)) {
-			putback_lru_page(page);
+		if (folio_test_anon(folio) && !folio_test_swapbacked(folio)) {
+			folio_putback_lru(folio);
 			continue;
 		}
 
-		list_add(&page->lru, &page_list);
-
-#ifdef CONFIG_OPLUS_SYSTEM_KERNEL_QCOM
-		inc_node_page_state(page, NR_ISOLATED_ANON +
-				page_is_file_cache(page));
-#endif
+		list_add(&folio->lru, &page_list);
+		node_stat_mod_folio(folio, NR_ISOLATED_ANON +
+				    folio_is_file_lru(folio),
+				    folio_nr_pages(folio));
 		rp->nr_scanned++;
 	}
 
@@ -861,6 +898,7 @@ static bool drop_swapcache_task(struct task_struct *task)
 {
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
+	struct vma_iterator vmi;
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	struct mm_walk reclaim_walk = {};
 #else
@@ -888,8 +926,7 @@ static bool drop_swapcache_task(struct task_struct *task)
 	spin_lock(&ntask->lock);
 	if (ntask->state != NS_OUT_CACHE) {
 #ifdef CONFIG_OPLUS_NANDSWAP_DEBUG
-		pr_info("exit dropcache
-");
+		pr_info("exit dropcache\n");
 #endif
 		spin_unlock(&ntask->lock);
 		goto out;
@@ -916,8 +953,9 @@ static bool drop_swapcache_task(struct task_struct *task)
 	reclaim_walk.pmd_entry = drop_swapcache_pte;
 #endif
 
-	down_read(&mm->mmap_lock);
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+	mmap_read_lock(mm);
+	vma_iter_init(&vmi, mm, 0);
+	for_each_vma(vmi, vma) {
 		if (is_vm_hugetlb_page(vma))
 			continue;
 
@@ -938,15 +976,14 @@ static bool drop_swapcache_task(struct task_struct *task)
 	}
 
 	flush_tlb_mm(mm);
-	up_read(&mm->mmap_lock);
+	mmap_read_unlock(mm);
 #ifdef CONFIG_OPLUS_NANDSWAP_DEBUG
 	a_task_anon = get_mm_counter(mm, MM_ANONPAGES);
 	a_task_swap = get_mm_counter(mm, MM_SWAPENTS);
 #endif
 	mmput(mm);
 #ifdef CONFIG_OPLUS_NANDSWAP_DEBUG
-	pr_info("cache %s (pid %d) (size %d-%d to %d-%d) scan %d reclaim %d
-",
+	pr_info("cache %s (pid %d) (size %d-%d to %d-%d) scan %d reclaim %d\n",
 		task->comm, task->pid, task_anon, task_swap,
 		a_task_anon, a_task_swap, rp.nr_scanned, rp.nr_reclaimed);
 #endif
@@ -987,7 +1024,7 @@ static int swapdropd_fn(void *p)
 
 			do {
 				msleep(30);
-			} while (nswapind && (nswapind->state == TASK_RUNNING));
+			} while (nswapind && task_is_running(nswapind));
 
 			retry = drop_swapcache_task(task);
 			put_task_struct(task);
@@ -998,8 +1035,8 @@ static int swapdropd_fn(void *p)
 			}
 		}
 
-		set_current_state(TASK_INTERRUPTIBLE);
-		freezable_schedule();
+		set_current_state(TASK_INTERRUPTIBLE | TASK_FREEZABLE);
+		schedule();
 
 		if (kthread_should_stop())
 			break;
@@ -1023,21 +1060,19 @@ static inline unsigned long nandswap_type(void)
 static int swap_ratio_pte(pmd_t *pmd, unsigned long start,
 				unsigned long end, struct mm_walk *walk)
 {
-	pte_t *orig_pte;
 	unsigned long index;
 	struct ns_swap_ratio *nsr = walk->private;
 	struct vm_area_struct *vma = nsr->vma;
 
-	if (pmd_none_or_trans_huge_or_clear_bad(pmd))
-		return 0;
-
 	for (index = start; index != end; index += PAGE_SIZE) {
-		pte_t pte;
+		pte_t pte, *orig_pte;
 		spinlock_t *ptl;
 		unsigned long type;
 
-		orig_pte = pte_offset_map_lock(vma->vm_mm, pmd, start, &ptl);
-		pte = *(orig_pte + ((index - start) / PAGE_SIZE));
+		orig_pte = pte_offset_map_lock(vma->vm_mm, pmd, index, &ptl);
+		if (!orig_pte)
+			return 0;
+		pte = ptep_get(orig_pte);
 		pte_unmap_unlock(orig_pte, ptl);
 
 		if (pte_present(pte) || pte_none(pte))
@@ -1057,6 +1092,7 @@ static unsigned long swap_ratio_task(struct task_struct *task, unsigned long typ
 {
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
+	struct vma_iterator vmi;
 	struct ns_swap_ratio nsr = {};
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)
 	struct mm_walk walk = {};
@@ -1080,8 +1116,9 @@ static unsigned long swap_ratio_task(struct task_struct *task, unsigned long typ
 	walk.private = &nsr;
 #endif
 
-	down_read(&mm->mmap_lock);
-	for (vma = mm->mmap; vma; vma = vma->vm_next) {
+	mmap_read_lock(mm);
+	vma_iter_init(&vmi, mm, 0);
+	for_each_vma(vmi, vma) {
 		if (is_vm_hugetlb_page(vma))
 			continue;
 
@@ -1097,7 +1134,7 @@ static unsigned long swap_ratio_task(struct task_struct *task, unsigned long typ
 	}
 
 	flush_tlb_mm(mm);
-	up_read(&mm->mmap_lock);
+	mmap_read_unlock(mm);
 	mmput(mm);
 out:
 	return nsr.nand + nsr.ram ? nsr.nand * 100 / (nsr.nand + nsr.ram) : 0;
@@ -1105,8 +1142,7 @@ out:
 
 static int swap_ctl_seq_show(struct seq_file *seq, void *p)
 {
-	seq_printf(seq, "%d %lu
-", nsi.pid, nsi.swap_ratio);
+	seq_printf(seq, "%d %lu\n", nsi.pid, nsi.swap_ratio);
 	return 0;
 }
 
@@ -1132,27 +1168,24 @@ static ssize_t swap_ctl_write(struct file *filp, const char __user *ubuf,
 	memset(kbuf, 0, sizeof(kbuf));
 	if (copy_from_user(kbuf, ubuf, cnt))
 		return -EFAULT;
-	kbuf[15] = ' ';
+	kbuf[15] = '\0';
 
 	act_str = strstrip(kbuf);
 	token = strsep(&act_str, " 	");
 	if (!token || kstrtol(token, 10, &value)) {
-		pr_err("NandSwap: write [%s] pid format is invalid.
-", kbuf);
+		pr_err("NandSwap: write [%s] pid format is invalid.\n", kbuf);
 		return -EINVAL;
 	}
 
 	if (value <= 0 || value > INT_MAX) {
-		pr_err("NandSwap: write [%s] is invalid.
-", kbuf);
+		pr_err("NandSwap: write [%s] is invalid.\n", kbuf);
 		return -EINVAL;
 	}
 
 	task_pid = (pid_t)value;
 
 	if (!act_str) {
-		pr_err("NandSwap: write [%s] do not set reclaim type.
-", kbuf);
+		pr_err("NandSwap: write [%s] do not set reclaim type.\n", kbuf);
 		return -EINVAL;
 	}
 
@@ -1167,8 +1200,7 @@ static ssize_t swap_ctl_write(struct file *filp, const char __user *ubuf,
 	task = find_task_by_vpid(task_pid);
 	if (!task) {
 		rcu_read_unlock();
-		pr_err("NandSwap: can not find task of pid:%d
-", task_pid);
+		pr_err("NandSwap: can not find task of pid:%d\n", task_pid);
 		return -ESRCH;
 	}
 
@@ -1219,8 +1251,7 @@ static const struct file_operations swap_ctl_fops = {
 
 static int fn_enable_seq_show(struct seq_file *seq, void *p)
 {
-	seq_printf(seq, "%d
-", nandswap_enable);
+	seq_printf(seq, "%d\n", nandswap_enable);
 	return 0;
 }
 
@@ -1339,8 +1370,7 @@ static const struct file_operations dev_life_fops = {
 
 static int life_protect_seq_show(struct seq_file *seq, void *offset)
 {
-	seq_printf(seq, "%d
-", nsi.life_protect);
+	seq_printf(seq, "%d\n", nsi.life_protect);
 	return 0;
 }
 
@@ -1371,36 +1401,21 @@ static int stat_info_seq_show(struct seq_file *seq, void *offset)
 
 	all_vm_events(events);
 
-	seq_printf(seq, "ns_fn_enable: %d
-"
-			"ns_fn_status: %lld
-"
-			"ns_life_protect: %d
-"
-			"ns_swap_limit: %d
-"
-			"ns_write_lifelong: %lld
-"
-			"ns_quota_today: %lld
-"
-			"ns_swap_out: %u
-"
-			"ns_swap_in: %u
-"
-			"ns_pg_out: %lld
-"
-			"ns_pg_in: %lld
-"
-			"ns_pg_out_act: %lld
-"
-			"ns_pg_out_inact: %lld
-"
-			"pswpout: %llu
-"
-			"pswpin: %llu
-"
-			"ns_dev_life_end: %u
-",
+	seq_printf(seq, "ns_fn_enable: %d\n"
+			"ns_fn_status: %lld\n"
+			"ns_life_protect: %d\n"
+			"ns_swap_limit: %d\n"
+			"ns_write_lifelong: %lld\n"
+			"ns_quota_today: %lld\n"
+			"ns_swap_out: %u\n"
+			"ns_swap_in: %u\n"
+			"ns_pg_out: %lld\n"
+			"ns_pg_in: %lld\n"
+			"ns_pg_out_act: %lld\n"
+			"ns_pg_out_inact: %lld\n"
+			"pswpout: %llu\n"
+			"pswpin: %llu\n"
+			"ns_dev_life_end: %u\n",
 			nandswap_enable,
 			(long long)nsi.fn_status,
 			nsi.life_protect,
@@ -1509,22 +1524,19 @@ static int __init nandswap_init(void)
 {
 	nswapoutd = kthread_run(swapoutd_fn, 0, "nswapoutd");
 	if (IS_ERR(nswapoutd)) {
-		pr_err("NandSwap: [%s] Failed to start nswapoutd
-", __func__);
+		pr_err("NandSwap: [%s] Failed to start nswapoutd\n", __func__);
 		nswapoutd = NULL;
 	}
 
 	nswapdropd = kthread_run(swapdropd_fn, 0, "nswapdropd");
 	if (IS_ERR(nswapdropd)) {
-		pr_err("NandSwap: [%s] Failed to start nswapdropd
-", __func__);
+		pr_err("NandSwap: [%s] Failed to start nswapdropd\n", __func__);
 		nswapdropd = NULL;
 	}
 
 	nswapind = kthread_run(swapind_fn, 0, "nswapind");
 	if (IS_ERR(nswapind)) {
-		pr_err("NandSwap: [%s] Failed to start nswapind
-", __func__);
+		pr_err("NandSwap: [%s] Failed to start nswapind\n", __func__);
 		nswapind = NULL;
 	}
 

@@ -38,12 +38,6 @@ bool is_fg(int uid)
 }
 EXPORT_SYMBOL_GPL(is_fg);
 
-static DEFINE_MUTEX(cpu_load_lock);
-static unsigned long last_load_jiffies;
-static int cached_load;
-static struct cpu_load_sample prev_sample;
-static bool has_prev_sample;
-
 struct cpu_load_sample {
 	u64 t_user;
 	u64 t_system;
@@ -52,6 +46,12 @@ struct cpu_load_sample {
 	u64 t_irq;
 	u64 t_softirq;
 };
+
+static DEFINE_MUTEX(cpu_load_lock);
+static unsigned long last_load_jiffies;
+static int cached_load;
+static struct cpu_load_sample prev_sample;
+static bool has_prev_sample;
 
 static u64 get_idle_time_ns(struct kernel_cpustat *kcs, int cpu)
 {
