@@ -20,3 +20,20 @@ config OPLUS_HEALTHINFO
 	help
 	  This option enables OPLUS healthinfo procfs interface (/proc/oplus_healthinfo)
 	  for ColorOS performance and system resource management.
+
+config OPLUS_DEVINFO
+	bool "OPLUS device info support"
+	default y
+	help
+	  This option enables the OPlus device info interface (/proc/devinfo).
+	  It dynamically discovers attached block storage (UFS/eMMC) and system
+	  memory (DDR type/capacity) using standard Linux kernel subsystems.
+
+config OPLUS_SCHED_ASSIST
+	bool "OPLUS sched assist support"
+	default y
+	help
+	  This option enables the OPlus scheduler assist interface located at
+	  /proc/oplus_scheduler/sched_assist. It provides real-time scene-based
+	  CPU frequency QoS boosting and dynamic CFS nice acceleration for
+	  user-experience (UX) and critical application threads.
