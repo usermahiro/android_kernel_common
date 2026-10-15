@@ -169,8 +169,13 @@ static int madvise_update_vma(struct vm_area_struct *vma,
 }
 
 #ifdef CONFIG_SWAP
+#if defined(CONFIG_OPLUS_NANDSWAP)
+int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
+		unsigned long end, struct mm_walk *walk)
+#else
 static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 		unsigned long end, struct mm_walk *walk)
+#endif
 {
 	struct vm_area_struct *vma = walk->private;
 	struct swap_iocb *splug = NULL;
@@ -183,6 +188,14 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 		swp_entry_t entry;
 		struct folio *folio;
 
+#if defined(CONFIG_OPLUS_NANDSWAP)
+		if (rwsem_is_contended(&vma->vm_mm->mmap_lock)) {
+			if (ptep)
+				pte_unmap_unlock(ptep, ptl);
+			swap_read_unplug(splug);
+			return -1;
+		}
+#endif
 		if (!ptep++) {
 			ptep = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
 			if (!ptep)

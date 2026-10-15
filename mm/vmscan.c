@@ -1645,6 +1645,42 @@ keep:
 	return nr_reclaimed;
 }
 
+#if defined(CONFIG_OPLUS_NANDSWAP)
+unsigned long nswap_reclaim_page_list(struct list_head *folio_list,
+				      struct vm_area_struct *vma, bool scan)
+{
+	struct reclaim_stat dummy_stat;
+	unsigned long nr_reclaimed;
+	unsigned long nr_scan = 0;
+	struct folio *folio;
+	struct scan_control sc = {
+		.gfp_mask = GFP_KERNEL,
+		.priority = DEF_PRIORITY,
+		.may_writepage = 1,
+		.may_unmap = 1,
+		.may_swap = 1,
+	};
+
+	list_for_each_entry(folio, folio_list, lru) {
+		folio_clear_active(folio);
+	}
+
+	nr_reclaimed = shrink_folio_list(folio_list, NULL, &sc, &dummy_stat, true);
+
+	while (!list_empty(folio_list)) {
+		folio = lru_to_folio(folio_list);
+		if (folio_test_swapcache(folio) && !folio_test_dirty(folio))
+			nr_scan += folio_nr_pages(folio);
+		list_del(&folio->lru);
+		node_stat_sub_folio(folio, NR_ISOLATED_ANON +
+				    folio_is_file_lru(folio));
+		folio_putback_lru(folio);
+	}
+
+	return scan ? nr_scan : nr_reclaimed;
+}
+#endif
+
 unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 					   struct list_head *folio_list)
 {
