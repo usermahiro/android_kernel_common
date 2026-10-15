@@ -9,7 +9,6 @@ This module contains a full list of kernel modules
 _COMMON_GKI_MODULES_LIST = [
     # keep sorted
     "drivers/block/virtio_blk.ko",
-    "drivers/block/zram/zram.ko",
     "drivers/bluetooth/btbcm.ko",
     "drivers/bluetooth/btqca.ko",
     "drivers/bluetooth/btsdio.ko",
@@ -54,7 +53,6 @@ _COMMON_GKI_MODULES_LIST = [
     "fs/netfs/netfs.ko",
     "kernel/kheaders.ko",
     "lib/crypto/libarc4.ko",
-    "mm/zsmalloc.ko",
     "net/6lowpan/6lowpan.ko",
     "net/6lowpan/nhc_dest.ko",
     "net/6lowpan/nhc_fragment.ko",

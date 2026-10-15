@@ -326,7 +326,11 @@ swp_entry_t folio_alloc_swap(struct folio *folio)
 	 */
 	cache = raw_cpu_ptr(&swp_slots);
 
+#if defined(CONFIG_OPLUS_NANDSWAP)
+	if (likely(check_cache_active() && cache->slots) && !current_is_nswapoutd()) {
+#else
 	if (likely(check_cache_active() && cache->slots)) {
+#endif
 		mutex_lock(&cache->alloc_lock);
 		if (cache->slots) {
 repeat:
