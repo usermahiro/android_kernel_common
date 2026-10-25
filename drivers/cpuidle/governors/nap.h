@@ -1,36 +1,38 @@
 /* SPDX-License-Identifier: GPL-2.0 */
-/*
- * nap.h - Neural Adaptive Predictor cpuidle governor (fixed-point, arm64/GKI)
- *
- * Independent fixed-point implementation written to the same behavioural
- * spec as firelzrd/nap v0.5.0 (MLP 8->8 trunk + ordinal survival head,
- * confidence-gated deepest-state selection, online SGD refinement). Not a
- * line-for-line port: upstream is x86-only (SSE2/AVX2 float intrinsics,
- * kernel_fpu_begin()/asm/fpu/api.h) which cannot build on arm64 at all, and
- * cpuidle_select() runs from do_idle() with IRQs disabled where
- * may_use_simd() is false on arm64 (kernel_neon_begin() would BUG_ON()), so
- * a NEON port isn't viable either. Everything here is plain integer/Q16.16
- * fixed-point arithmetic - no FPU, no SIMD, bit-identical across CPUs.
- */
 #ifndef _NAP_H
 #define _NAP_H
 
 #include <linux/types.h>
 #include <linux/cpuidle.h>
+#include <linux/ktime.h>
 
-/* ----------------------------------------------------------------
- * Fixed-point format: Q16.16 signed 32-bit, with s64 intermediates
- * for multiply to avoid overflow.
- * ---------------------------------------------------------------- */
-#define NAP_FP_SHIFT		16
-#define NAP_FP_ONE		(1 << NAP_FP_SHIFT)
+/* ponytail: Q16.16 fixed-point replaces x86 SSE2/AVX2 kernel_fpu_begin() (unsafe in arm64 do_idle with IRQs off); add NEON when cpuidle_select runs in preemptible/SIMD-allowed context. */
+#define NAP_FP_SHIFT			16
+#define NAP_FP_ONE			(1 << NAP_FP_SHIFT)
+
+#define NAP_INPUT_SIZE			8
+#define NAP_HIDDEN_SIZE			8
+#define NAP_NUM_CUTS			(CPUIDLE_STATE_MAX - 1)
+#define NAP_HISTORY_SIZE		8
+
+#define NAP_POLL_LIMIT_MIN_NS		1000ULL
+#define NAP_POLL_LIMIT_MARGIN_NS	1000ULL
+#define NAP_MIN_STATE_REFRESH_JIFFIES	HZ
 
 static inline s32 nap_fp_from_int(s32 x)
 {
 	return x << NAP_FP_SHIFT;
 }
 
-/* Saturating Q16.16 multiply. */
+static inline s32 nap_fp_clamp(s32 v, s32 lo, s32 hi)
+{
+	if (v < lo)
+		return lo;
+	if (v > hi)
+		return hi;
+	return v;
+}
+
 static inline s32 nap_fp_mul(s32 a, s32 b)
 {
 	s64 r = ((s64)a * (s64)b) >> NAP_FP_SHIFT;
@@ -42,23 +44,9 @@ static inline s32 nap_fp_mul(s32 a, s32 b)
 	return (s32)r;
 }
 
-/* ----------------------------------------------------------------
- * Neural network dimensions
- * ---------------------------------------------------------------- */
-#define NAP_INPUT_SIZE		8
-#define NAP_HIDDEN_SIZE		8
-#define NAP_NUM_CUTS		(CPUIDLE_STATE_MAX - 1)
-#define NAP_HISTORY_SIZE	8
-
-/*
- * Weights for the 8->8 ReLU MLP trunk feeding a shared linear score
- * s = w_out . h + b_out, which is the input to a proportional-odds
- * ordinal survival head: for boundary k, q_k = sigmoid(s - thr_ord[k]).
- * All values are Q16.16 fixed point.
- */
 struct nap_weights {
-	s32 w1[NAP_INPUT_SIZE][NAP_HIDDEN_SIZE];
-	s32 b1[NAP_HIDDEN_SIZE];
+	s32 w_h1[NAP_INPUT_SIZE][NAP_HIDDEN_SIZE];
+	s32 b_h1[NAP_HIDDEN_SIZE];
 	s32 w_out[NAP_HIDDEN_SIZE];
 	s32 b_out;
 	s32 thr_ord[NAP_NUM_CUTS];
@@ -72,38 +60,52 @@ struct nap_stats {
 };
 
 struct nap_cpu_data {
-	/* Ring buffer of recent idle durations, log2(ns) in Q16.16 */
+	u64 history[NAP_HISTORY_SIZE];
 	s32 log_history[NAP_HISTORY_SIZE];
 	int hist_idx;
 	int hist_count;
 
-	/* Cached shallowest valid state (latency_req gated) */
+	u64 prev_idle_exit;
+	s64 last_predicted_ns;
+	s64 last_prediction_error;
+
+	bool short_circuited;
 	int cached_min_state;
 	s64 cached_min_state_latency;
 	unsigned long cached_min_state_jiffies;
 
-	/* select() -> reflect() handoff */
+	unsigned long last_learn_jiffies;
+	unsigned int learn_jiffies_min;
+
 	int last_selected_idx;
-	bool short_circuited;
 
-	/* Per-state log2(target_residency_ns), Q16.16, filled by nap_enable() */
-	s32 log2_tres[CPUIDLE_STATE_MAX];
-
-	/* Forward-pass scratch, reused by the learning step */
-	s32 hidden[NAP_HIDDEN_SIZE];
+	s32 nn_output;
+	s32 hidden_out[NAP_HIDDEN_SIZE];
 	s32 features[NAP_INPUT_SIZE];
-	s32 score;
+
+	s32 learn_d_out;
+	s32 learn_lr;
+	s32 learn_d_hid[NAP_HIDDEN_SIZE];
+
+	s32 log2_tres[CPUIDLE_STATE_MAX];
+	s32 bin_count[CPUIDLE_STATE_MAX];
+
+	bool needs_learn;
+	bool have_sample;
+	u64 learn_actual_ns;
 
 	struct nap_weights weights;
 
-	/* Online learning */
-	unsigned int learning_rate_millths;	/* /1000, e.g. 1 = 0.001 */
-	unsigned int conf_millths;		/* decision confidence, /1000 */
+	unsigned int learning_rate_millths;
+	unsigned int max_grad_norm_millths;
+	unsigned int conf_millths;
 	int learn_interval;
 	int learn_counter;
 	bool reset_pending;
 
 	struct nap_stats stats;
 };
+
+DECLARE_PER_CPU(struct nap_cpu_data, nap_data);
 
 #endif /* _NAP_H */
