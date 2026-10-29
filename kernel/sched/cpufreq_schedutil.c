@@ -982,10 +982,12 @@ EXPORT_SYMBOL_GPL(sugov_effective_cpu_perf);
  * @boost: additional utilization boost (e.g. from IO wait).
  * @out_util: pointer to store the effective utilization (with DVFS headroom).
  * @out_bw_min: pointer to store the minimum bandwidth requirement.
+ * @out_bw_max: pointer to store the maximum bandwidth limit.
  */
 void cpufreq_get_effective_util(int cpu, unsigned long boost,
 				unsigned long *out_util,
-				unsigned long *out_bw_min)
+				unsigned long *out_bw_min,
+				unsigned long *out_bw_max)
 {
 	unsigned long min, max, util = scx_cpuperf_target(cpu);
 
@@ -994,6 +996,7 @@ void cpufreq_get_effective_util(int cpu, unsigned long boost,
 	util = effective_cpu_util(cpu, util, &min, &max);
 	util = max(util, boost);
 	*out_bw_min = min;
+	*out_bw_max = max;
 	*out_util = sugov_effective_cpu_perf(cpu, util, min, max);
 }
 EXPORT_SYMBOL_GPL(cpufreq_get_effective_util);

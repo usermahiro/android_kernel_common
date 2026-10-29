@@ -226,11 +226,15 @@ int idle_cpu(int cpu)
 	return 1;
 }
 
+#ifdef ANDROID_KABI_REVERSE
+EXPORT_SYMBOL_GPL(idle_cpu);
+#endif
+
 /**
  * available_idle_cpu - is a given CPU idle for enqueuing work.
  * @cpu: the CPU in question.
  *
- * Return: 1 if the CPU is currently idle. 0 otherwise.
+ * Return: 1 if the CPU is available. 0 otherwise.
  */
 int available_idle_cpu(int cpu)
 {
