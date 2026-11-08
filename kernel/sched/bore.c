@@ -11,13 +11,13 @@
 DEFINE_STATIC_KEY_TRUE(sched_bore_key);
 u8   __read_mostly sched_bore                   = 1;
 u8   __read_mostly sched_burst_inherit_type     = 2;
-u8   __read_mostly sched_burst_protect_slice_lv = 1;
-u8   __read_mostly sched_burst_smoothness       = 1;
-u8   __read_mostly sched_burst_penalty_offset   = 24;
-uint __read_mostly sched_burst_penalty_scale    = 1536;
+u8   __read_mostly sched_burst_protect_slice_lv = 0;
+u8   __read_mostly sched_burst_smoothness       = 2;
+u8   __read_mostly sched_burst_penalty_offset   = 27;
+uint __read_mostly sched_burst_penalty_scale    = 1024;
 uint __read_mostly sched_burst_cache_lifetime   = 75000000;
 
-uint __read_mostly sched_credit_cap_us = 16000;
+uint __read_mostly sched_credit_cap_us = 4000;
 
 static int __maybe_unused maxval_prio    =   39;
 static int __maybe_unused maxval_6_bits  =   63;
@@ -34,7 +34,7 @@ static u32 bore_reciprocal_lut[BURST_CACHE_SAMPLE_LIMIT + 1];
 
 DEFINE_STATIC_KEY_TRUE(sched_burst_inherit_key);
 DEFINE_STATIC_KEY_TRUE(sched_burst_ancestor_key);
-DEFINE_STATIC_KEY_TRUE (sched_burst_protect_slice_cond_key);
+DEFINE_STATIC_KEY_FALSE(sched_burst_protect_slice_cond_key);
 DEFINE_STATIC_KEY_FALSE(sched_burst_protect_slice_prefer_key);
 DEFINE_STATIC_KEY_FALSE(sched_credit_key);
 

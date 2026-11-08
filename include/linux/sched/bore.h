@@ -28,7 +28,7 @@ DECLARE_STATIC_KEY_FALSE(sched_credit_key);
 extern void bore_note_sleep(struct task_struct *p, u64 now);
 extern u64  bore_credit_ns(struct task_struct *p);
 
-DECLARE_STATIC_KEY_TRUE(sched_burst_protect_slice_cond_key);
+DECLARE_STATIC_KEY_FALSE(sched_burst_protect_slice_cond_key);
 DECLARE_STATIC_KEY_FALSE(sched_burst_protect_slice_prefer_key);
 
 static inline u8 bore_score(struct task_struct *p)
