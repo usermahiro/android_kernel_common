@@ -30,10 +30,12 @@
 #define UX_MAGIC 0x27
 #define CMD_UX_READ  _IOR(UX_MAGIC, 0, int[2])
 #define CMD_UX_WRITE _IOW(UX_MAGIC, 1, int[3])
+#define BINDER_UX_IOCTL_SET_FLAG 0x407a6900
 
 static struct proc_dir_entry *oplus_sched_dir;
 static struct proc_dir_entry *sched_assist_dir;
 static struct proc_dir_entry *audio_dir;
+static struct proc_dir_entry *oplus_binder_dir;
 
 static int current_scene;
 static unsigned long scene_timestamp;
@@ -336,14 +338,25 @@ static int ux_task_show(struct seq_file *m, void *v)
 static int write_task_ux(pid_t pid, pid_t tid, int ux_value, bool is_system)
 {
 	pid_t target = tid ? tid : pid;
+	bool enable;
 
 	if (target <= 0)
 		return -EINVAL;
 
+	/*
+	 * Backward & Forward compatibility:
+	 * - ux_value == 0: disable UX (legacy boolean 0)
+	 * - ux_value >= 256: disable UX (ColorOS CancelUx, e.g. 256)
+	 * - ux_value < 0: disable UX
+	 * - ux_value == 1: enable UX (legacy boolean 1)
+	 * - ux_value in (0, 256): enable UX (ColorOS priority, e.g. 136)
+	 */
+	enable = (ux_value > 0 && ux_value < 256);
+
 	if (is_system)
-		add_or_update_task(ux_tasks, &ux_lock, target, -3, (ux_value != 0));
+		add_or_update_task(ux_tasks, &ux_lock, target, -3, enable);
 	else
-		add_or_update_task(app_ux_tasks, &app_ux_lock, target, -3, (ux_value != 0));
+		add_or_update_task(app_ux_tasks, &app_ux_lock, target, -3, enable);
 
 	return 0;
 }
@@ -371,6 +384,95 @@ static int read_task_ux(pid_t pid, pid_t tid, bool is_system)
 	return ux_state;
 }
 
+static int parse_ux_task_args(char *buf, pid_t *pid, pid_t *tid, int *val)
+{
+	char *token, *s = strstrip(buf);
+	int nums[3];
+	int num_count = 0;
+	bool has_prefix = false;
+
+	if (!s || !*s)
+		return -EINVAL;
+
+	/*
+	 * ColorOS protocol support:
+	 * Format may begin with 'p' or 'P', e.g.: "p <pid> <tid> <prio>"
+	 */
+	if (*s == 'p' || *s == 'P') {
+		has_prefix = true;
+		s++;
+		s = strstrip(s);
+	}
+
+	while ((token = strsep(&s, " \t,")) != NULL) {
+		token = strstrip(token);
+		if (!*token)
+			continue;
+		if (num_count < 3) {
+			int n;
+			if (kstrtoint(token, 0, &n))
+				return -EINVAL;
+			nums[num_count++] = n;
+		}
+	}
+
+	if (num_count == 0)
+		return -EINVAL;
+
+	*pid = 0;
+	*tid = 0;
+	*val = 1;
+
+	if (has_prefix) {
+		/*
+		 * ColorOS format:
+		 * 3 args: "p <pid> <tid> <prio>" (e.g. "p 1694 1763 136")
+		 * 2 args: "p <pid> <tid>"
+		 * 1 arg:  "p <tid>"
+		 */
+		if (num_count >= 3) {
+			*pid = nums[0];
+			*tid = nums[1];
+			*val = nums[2];
+		} else if (num_count == 2) {
+			*pid = nums[0];
+			*tid = nums[1];
+			*val = 1;
+		} else {
+			*tid = nums[0];
+			*val = 1;
+		}
+	} else {
+		/*
+		 * Legacy format (backward compatibility):
+		 * 3 args: "<pid> <tid> <val>"
+		 * 2 args:
+		 *   if nums[1] <= 1: "<pid> <val>" (legacy boolean enable/disable)
+		 *   if nums[1] > 1:  "<pid> <tid>" (val defaults to 1)
+		 * 1 arg:  "<pid>" (val defaults to 1)
+		 */
+		if (num_count >= 3) {
+			*pid = nums[0];
+			*tid = nums[1];
+			*val = nums[2];
+		} else if (num_count == 2) {
+			if (nums[1] == 0 || nums[1] == 1) {
+				*pid = nums[0];
+				*val = nums[1];
+			} else {
+				*pid = nums[0];
+				*tid = nums[1];
+				*val = 1;
+			}
+		} else {
+			*pid = nums[0];
+			*val = 1;
+		}
+	}
+
+	return 0;
+}
+
 static int ux_task_open(struct inode *inode, struct file *file)
 {
 	return single_open(file, ux_task_show, NULL);
@@ -380,9 +482,9 @@ static ssize_t ux_task_write(struct file *filp, const char __user *ubuf,
 			     size_t cnt, loff_t *ppos)
 {
 	char kbuf[64];
-	char *token, *s;
-	pid_t pid = 0;
+	pid_t pid = 0, tid = 0;
 	int val = 1;
+	int ret;
 
 	if (cnt >= sizeof(kbuf))
 		return -EINVAL;
@@ -391,18 +493,14 @@ static ssize_t ux_task_write(struct file *filp, const char __user *ubuf,
 		return -EFAULT;
 	kbuf[cnt] = '\0';
 
-	s = strstrip(kbuf);
-	token = strsep(&s, " ");
-	if (!token || kstrtoint(token, 0, &pid))
-		return -EINVAL;
+	ret = parse_ux_task_args(kbuf, &pid, &tid, &val);
+	if (ret)
+		return ret;
 
-	if (s) {
-		token = strstrip(s);
-		if (kstrtoint(token, 0, &val))
-			val = 1;
-	}
+	ret = write_task_ux(pid, tid, val, true);
+	if (ret)
+		return ret;
 
-	write_task_ux(pid, 0, val, true);
 	return cnt;
 }
 
@@ -483,9 +581,9 @@ static ssize_t ux_task_app_write(struct file *filp, const char __user *ubuf,
 				 size_t cnt, loff_t *ppos)
 {
 	char kbuf[64];
-	char *token, *s;
-	pid_t pid = 0;
+	pid_t pid = 0, tid = 0;
 	int val = 1;
+	int ret;
 
 	if (cnt >= sizeof(kbuf))
 		return -EINVAL;
@@ -494,18 +592,14 @@ static ssize_t ux_task_app_write(struct file *filp, const char __user *ubuf,
 		return -EFAULT;
 	kbuf[cnt] = '\0';
 
-	s = strstrip(kbuf);
-	token = strsep(&s, " ");
-	if (!token || kstrtoint(token, 0, &pid))
-		return -EINVAL;
+	ret = parse_ux_task_args(kbuf, &pid, &tid, &val);
+	if (ret)
+		return ret;
 
-	if (s) {
-		token = strstrip(s);
-		if (kstrtoint(token, 0, &val))
-			val = 1;
-	}
+	ret = write_task_ux(pid, tid, val, false);
+	if (ret)
+		return ret;
 
-	write_task_ux(pid, 0, val, false);
 	return cnt;
 }
 
@@ -598,7 +692,11 @@ static ssize_t ddl_task_write(struct file *filp, const char __user *ubuf,
 	kbuf[cnt] = '\0';
 
 	s = strstrip(kbuf);
-	token = strsep(&s, " ");
+	if (*s == 'p' || *s == 'P') {
+		s++;
+		s = strstrip(s);
+	}
+	token = strsep(&s, " \t,");
 	if (!token || kstrtoint(token, 0, &pid))
 		return -EINVAL;
 
@@ -608,7 +706,7 @@ static ssize_t ddl_task_write(struct file *filp, const char __user *ubuf,
 			val = 1;
 	}
 
-	add_or_update_task(ddl_tasks, &ddl_lock, pid, -4, (val != 0));
+	add_or_update_task(ddl_tasks, &ddl_lock, pid, -4, (val > 0 && val < 256));
 	return cnt;
 }
 
@@ -666,7 +764,11 @@ static ssize_t sched_impt_task_write(struct file *filp, const char __user *ubuf,
 	kbuf[cnt] = '\0';
 
 	s = strstrip(kbuf);
-	token = strsep(&s, " ");
+	if (*s == 'p' || *s == 'P') {
+		s++;
+		s = strstrip(s);
+	}
+	token = strsep(&s, " \t,");
 	if (!token || kstrtoint(token, 0, &pid))
 		return -EINVAL;
 
@@ -676,7 +778,7 @@ static ssize_t sched_impt_task_write(struct file *filp, const char __user *ubuf,
 			val = 1;
 	}
 
-	add_or_update_task(impt_tasks, &impt_lock, pid, -1, (val != 0));
+	add_or_update_task(impt_tasks, &impt_lock, pid, -1, (val > 0 && val < 256));
 	return cnt;
 }
 
@@ -699,11 +801,13 @@ static int im_flag_open(struct inode *inode, struct file *file)
 	return single_open(file, im_flag_show, NULL);
 }
 
-static ssize_t im_flag_write(struct file *filp, const char __user *ubuf,
-			     size_t cnt, loff_t *ppos)
+static int parse_im_flag_input(const char __user *ubuf, size_t cnt, pid_t *out_pid, int *out_val)
 {
-	char kbuf[16];
-	int val;
+	char kbuf[64];
+	char *token, *s;
+	int val = 0;
+	pid_t pid = 0;
+	bool has_prefix = false;
 
 	if (cnt >= sizeof(kbuf))
 		return -EINVAL;
@@ -712,10 +816,57 @@ static ssize_t im_flag_write(struct file *filp, const char __user *ubuf,
 		return -EFAULT;
 	kbuf[cnt] = '\0';
 
-	if (kstrtoint(strstrip(kbuf), 0, &val))
+	s = strstrip(kbuf);
+	if (*s == 'p' || *s == 'P') {
+		has_prefix = true;
+		s++;
+		s = strstrip(s);
+	}
+
+	token = strsep(&s, " \t,");
+	if (!token || kstrtoint(token, 0, &val))
 		return -EINVAL;
 
+	if (has_prefix) {
+		/* Format: "p <pid> [flag]" */
+		pid = val;
+		val = 1;
+		if (s) {
+			token = strstrip(s);
+			if (*token && kstrtoint(token, 0, &val))
+				val = 1;
+		}
+	} else if (s && *strstrip(s)) {
+		/* Format: "<pid> <flag>" */
+		pid = val;
+		token = strstrip(s);
+		if (kstrtoint(token, 0, &val))
+			val = 1;
+	} else {
+		/* Format: "<flag>" (legacy backward compatibility) */
+		pid = 0;
+	}
+
+	*out_pid = pid;
+	*out_val = val;
+	return 0;
+}
+
+static ssize_t im_flag_write(struct file *filp, const char __user *ubuf,
+			     size_t cnt, loff_t *ppos)
+{
+	pid_t pid = 0;
+	int val = 0;
+	int ret;
+
+	ret = parse_im_flag_input(ubuf, cnt, &pid, &val);
+	if (ret)
+		return ret;
+
 	im_flag_val = val;
+	if (pid > 0)
+		add_or_update_task(impt_tasks, &impt_lock, pid, -2, (val > 0 && val < 256));
+
 	return cnt;
 }
 
@@ -741,20 +892,18 @@ static int im_flag_app_open(struct inode *inode, struct file *file)
 static ssize_t im_flag_app_write(struct file *filp, const char __user *ubuf,
 				 size_t cnt, loff_t *ppos)
 {
-	char kbuf[16];
-	int val;
+	pid_t pid = 0;
+	int val = 0;
+	int ret;
 
-	if (cnt >= sizeof(kbuf))
-		return -EINVAL;
-
-	if (copy_from_user(kbuf, ubuf, cnt))
-		return -EFAULT;
-	kbuf[cnt] = '\0';
-
-	if (kstrtoint(strstrip(kbuf), 0, &val))
-		return -EINVAL;
+	ret = parse_im_flag_input(ubuf, cnt, &pid, &val);
+	if (ret)
+		return ret;
 
 	im_flag_app_val = val;
+	if (pid > 0)
+		add_or_update_task(app_ux_tasks, &app_ux_lock, pid, -2, (val > 0 && val < 256));
+
 	return cnt;
 }
 
@@ -764,6 +913,91 @@ static const struct proc_ops im_flag_app_proc_ops = {
 	.proc_write   = im_flag_app_write,
 	.proc_lseek   = seq_lseek,
 	.proc_release = single_release,
+};
+
+/* /proc/oplus_binder/ux_flag */
+static int oplus_binder_ux_flag_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "%d\n", im_flag_val);
+	return 0;
+}
+
+static int oplus_binder_ux_flag_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, oplus_binder_ux_flag_show, NULL);
+}
+
+static ssize_t oplus_binder_ux_flag_write(struct file *filp, const char __user *ubuf,
+					  size_t cnt, loff_t *ppos)
+{
+	pid_t pid = 0;
+	int val = 0;
+	int ret;
+
+	ret = parse_im_flag_input(ubuf, cnt, &pid, &val);
+	if (ret)
+		return ret;
+
+	im_flag_val = val;
+	if (pid > 0)
+		add_or_update_task(impt_tasks, &impt_lock, pid, -2, (val > 0 && val < 256));
+
+	return cnt;
+}
+
+static long proc_oplus_binder_ux_flag_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	void __user *uarg = (void __user *)arg;
+
+	if (cmd == BINDER_UX_IOCTL_SET_FLAG) {
+		int param[2];
+
+		if (copy_from_user(param, uarg, sizeof(param)))
+			return -EFAULT;
+
+		if (param[0] > 0)
+			add_or_update_task(impt_tasks, &impt_lock, param[0], -2,
+					   (param[1] > 0 && param[1] < 256));
+
+		return 0;
+	} else if (cmd == CMD_UX_WRITE) {
+		int write_ux_param[3];
+
+		if (copy_from_user(write_ux_param, uarg, sizeof(write_ux_param)))
+			return -EFAULT;
+
+		return write_task_ux(write_ux_param[0], write_ux_param[1], write_ux_param[2], true);
+	} else if (cmd == CMD_UX_READ) {
+		int read_ux_param[2];
+
+		if (copy_from_user(read_ux_param, uarg, sizeof(read_ux_param)))
+			return -EFAULT;
+
+		return read_task_ux(read_ux_param[0], read_ux_param[1], true);
+	}
+
+	return -EINVAL;
+}
+
+#ifdef CONFIG_COMPAT
+static long proc_oplus_binder_ux_flag_compat_ioctl(struct file *file,
+						   unsigned int cmd,
+						   unsigned long arg)
+{
+	return proc_oplus_binder_ux_flag_ioctl(file, cmd, (unsigned long)(compat_ptr(arg)));
+}
+#endif
+
+static const struct proc_ops oplus_binder_ux_flag_proc_ops = {
+	.proc_open    = oplus_binder_ux_flag_open,
+	.proc_read    = seq_read,
+	.proc_write   = oplus_binder_ux_flag_write,
+	.proc_lseek   = seq_lseek,
+	.proc_release = single_release,
+	.proc_ioctl   = proc_oplus_binder_ux_flag_ioctl,
+#ifdef CONFIG_COMPAT
+	.proc_compat_ioctl = proc_oplus_binder_ux_flag_compat_ioctl,
+#endif
 };
 
 static int disable_setting_show(struct seq_file *m, void *v)
@@ -1071,6 +1305,12 @@ static int __init oplus_sched_assist_init(void)
 		proc_create("status", 0666, audio_dir, &audio_status_proc_ops);
 	}
 
+	oplus_binder_dir = proc_mkdir("oplus_binder", NULL);
+	if (oplus_binder_dir) {
+		proc_create("ux_flag", 0666, oplus_binder_dir,
+			    &oplus_binder_ux_flag_proc_ops);
+	}
+
 #ifdef CONFIG_SYSCTL
 	sched_assist_sysctl_header = register_sysctl("kernel", sched_assist_kern_table);
 #endif
@@ -1112,6 +1352,11 @@ static void __exit oplus_sched_assist_exit(void)
 
 	if (oplus_sched_dir)
 		remove_proc_entry("oplus_scheduler", NULL);
+
+	if (oplus_binder_dir) {
+		remove_proc_entry("ux_flag", oplus_binder_dir);
+		remove_proc_entry("oplus_binder", NULL);
+	}
 }
 
 module_init(oplus_sched_assist_init);
@@ -1120,5 +1365,5 @@ module_exit(oplus_sched_assist_exit);
 MODULE_LICENSE("GPL v2");
 MODULE_AUTHOR("RapliVx <raffikun1203@gmail.com>");
 MODULE_DESCRIPTION("OPlus Sched Assist and UX Task Acceleration Driver");
-MODULE_VERSION("1.0.0");
+MODULE_VERSION("1.3.0");
 MODULE_ALIAS("oplus_sched_assist");
