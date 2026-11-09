@@ -32,6 +32,12 @@ config ZRAM_BACKEND_ZSTD
 	select ZSTD_COMPRESS
 	select ZSTD_DECOMPRESS
 
+config ZRAM_BACKEND_ZSTDN
+	bool "zstdn and zstdn_o compression support"
+	depends on ZRAM
+	select ZSTD_COMPRESS
+	select ZSTD_DECOMPRESS
+
 config ZRAM_BACKEND_DEFLATE
 	bool "deflate compression support"
 	depends on ZRAM
@@ -82,6 +88,14 @@ config ZRAM_DEF_COMP_ZSTD
 	bool "zstd"
 	depends on ZRAM_BACKEND_ZSTD
 
+config ZRAM_DEF_COMP_ZSTDN
+	bool "zstdn"
+	depends on ZRAM_BACKEND_ZSTDN
+
+config ZRAM_DEF_COMP_ZSTDN_O
+	bool "zstdn_o"
+	depends on ZRAM_BACKEND_ZSTDN
+
 config ZRAM_DEF_COMP_DEFLATE
 	bool "deflate"
 	depends on ZRAM_BACKEND_DEFLATE
@@ -100,6 +114,8 @@ config ZRAM_DEF_COMP
 	default "lz4" if ZRAM_DEF_COMP_LZ4
 	default "lz4hc" if ZRAM_DEF_COMP_LZ4HC
 	default "zstd" if ZRAM_DEF_COMP_ZSTD
+	default "zstdn" if ZRAM_DEF_COMP_ZSTDN
+	default "zstdn_o" if ZRAM_DEF_COMP_ZSTDN_O
 	default "deflate" if ZRAM_DEF_COMP_DEFLATE
 	default "842" if ZRAM_DEF_COMP_842
 	default "unset-value"
