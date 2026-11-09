@@ -10,4 +10,11 @@ zram-$(CONFIG_ZRAM_BACKEND_DEFLATE)	+= backend_deflate.o
 zram-$(CONFIG_ZRAM_BACKEND_842)		+= backend_842.o
 
 obj-$(CONFIG_ZRAM)	+=	zram.o
+zram-$(CONFIG_HYBRIDSWAP) += hybridswap/hybridmain.o
+zram-$(CONFIG_HYBRIDSWAP_SWAPD) += hybridswap/hybridswapd.o
+zram-$(CONFIG_HYBRIDSWAP_CORE) += hybridswap/hybridswap.o
+
+CFLAGS_hybridswap/hybridswap.o := -Wno-error=format
+CFLAGS_hybridswap/hybridmain.o := -Wno-error=format
+CFLAGS_hybridswap/hybridswapd.o := -Wno-error=format
 zram-$(CONFIG_ZRAM_BACKEND_ZSTDN)	+= backend_zstdn.o
