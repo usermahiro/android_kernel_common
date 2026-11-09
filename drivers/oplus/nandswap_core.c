@@ -69,6 +69,31 @@
 #include <linux/sched/signal.h>
 #include <linux/sched/task.h>
 
+#if defined(CONFIG_HYBRIDSWAP) || defined(CONFIG_OPLUS_HYBRIDSWAP)
+/*
+ * Hybridswap Priority Rule:
+ * When Hybridswap is enabled, Nandswap is kept in the codebase as a fallback
+ * but deactivated to avoid conflicts and give Hybridswap 100% priority.
+ */
+struct task_struct *nswapoutd = NULL;
+struct task_struct *nswapind = NULL;
+struct task_struct *nswapdropd = NULL;
+bool nandswap_enable __read_mostly = false;
+
+static int __init nandswap_init(void)
+{
+	pr_info("oplus_nandswap: Disabled because Hybridswap takes priority\n");
+	return 0;
+}
+
+static void __exit nandswap_exit(void)
+{
+}
+
+module_init(nandswap_init);
+module_exit(nandswap_exit);
+#else
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
 #define walk_page_range_hook(mm, start, end, walk, rp) \
 	walk_page_range(mm, start, end, walk, rp)
@@ -1574,3 +1599,4 @@ static void __exit nandswap_exit(void)
 module_init(nandswap_init);
 module_exit(nandswap_exit);
 MODULE_LICENSE("GPL v2");
+#endif /* !CONFIG_HYBRIDSWAP && !CONFIG_OPLUS_HYBRIDSWAP */

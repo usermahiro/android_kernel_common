@@ -46,6 +46,10 @@ extern unsigned long nswap_reclaim_page_list(struct list_head *page_list,
 
 static inline bool current_is_nswapoutd(void)
 {
+#if defined(CONFIG_HYBRIDSWAP) || defined(CONFIG_OPLUS_HYBRIDSWAP)
+	return false;
+#else
 	return current == nswapoutd;
+#endif
 }
 #endif /* _NAND_SWAP_H */
