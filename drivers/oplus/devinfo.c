@@ -302,17 +302,17 @@ static int devinfo_ufs_show(struct seq_file *m, void *v)
 	ensure_hardware_probed();
 
 	if (storage_info.is_ufs) {
-		seq_printf(m, "%s %s %s\n", storage_info.vendor, storage_info.model, storage_info.rev);
+		seq_printf(m, "device: %s %s %s\n", storage_info.vendor, storage_info.model, storage_info.rev);
 		seq_printf(m, "vendor: %s\n", storage_info.vendor);
-		seq_printf(m, "manufacture: %s\n", storage_info.vendor);
 		seq_printf(m, "model: %s\n", storage_info.model);
 		seq_printf(m, "rev: %s\n", storage_info.rev);
 		seq_printf(m, "version: %s\n", storage_info.version);
 		seq_printf(m, "type: %s\n", storage_info.version);
 		seq_printf(m, "size: %lluMB\n", storage_info.size_mb);
 		seq_puts(m, "health: normal\n");
+		seq_printf(m, "manufacture: %s\n", storage_info.vendor);
 	} else {
-		seq_puts(m, "none\nstatus: not_present\n");
+		seq_puts(m, "device: none\nstatus: not_present\n");
 	}
 	return 0;
 }
@@ -334,16 +334,16 @@ static int devinfo_emmc_show(struct seq_file *m, void *v)
 	ensure_hardware_probed();
 
 	if (storage_info.is_emmc) {
-		seq_printf(m, "%s %s %s\n", storage_info.vendor, storage_info.model, storage_info.rev);
+		seq_printf(m, "device: %s %s %s\n", storage_info.vendor, storage_info.model, storage_info.rev);
 		seq_printf(m, "vendor: %s\n", storage_info.vendor);
-		seq_printf(m, "manufacture: %s\n", storage_info.vendor);
 		seq_printf(m, "model: %s\n", storage_info.model);
 		seq_printf(m, "rev: %s\n", storage_info.rev);
 		seq_printf(m, "version: %s\n", storage_info.version);
 		seq_printf(m, "type: %s\n", storage_info.version);
 		seq_printf(m, "size: %lluMB\n", storage_info.size_mb);
+		seq_printf(m, "manufacture: %s\n", storage_info.vendor);
 	} else {
-		seq_puts(m, "none\nstatus: not_present\n");
+		seq_puts(m, "device: none\nstatus: not_present\n");
 	}
 	return 0;
 }
@@ -364,7 +364,7 @@ static int devinfo_ddr_show(struct seq_file *m, void *v)
 {
 	ensure_hardware_probed();
 
-	seq_printf(m, "%s %luMB\n", ram_info.type, ram_info.size_mb);
+	seq_printf(m, "device: %s %luMB\n", ram_info.type, ram_info.size_mb);
 	seq_printf(m, "type: %s\n", ram_info.type);
 	seq_printf(m, "size: %luMB\n", ram_info.size_mb);
 	seq_printf(m, "freq: %s\n", ram_info.freq);
