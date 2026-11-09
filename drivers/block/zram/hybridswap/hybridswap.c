@@ -16,6 +16,7 @@
 #include <linux/blkdev.h>
 #include <linux/vmalloc.h>
 #include <linux/fs.h>
+MODULE_IMPORT_NS(MINIDUMP);
 #include <linux/bio.h>
 
 #include "../zram_drv.h"
@@ -28,20 +29,8 @@
 #endif
 
 /* Compatibility macros for kernel APIs that changed in 6.12 */
-#if !defined(blkdev_put)
-#define blkdev_put(b, f) blkdev_put_no_open(b)
-#endif
-#if !defined(blkdev_get_by_dev)
-static inline struct block_device *blkdev_get_by_dev(dev_t dev, unsigned int mode, void *holder)
-{
-	return blkdev_get_no_open(dev);
-}
-#endif
 #if !defined(bio_set_op_attrs)
 #define bio_set_op_attrs(bio, op, dir) ((bio)->bi_opf = (op))
-#endif
-#if !defined(FMODE_EXCL)
-#define FMODE_EXCL 0x80000
 #endif
 #ifndef BIO_MAX_PAGES
 #define BIO_MAX_PAGES 256
@@ -208,7 +197,7 @@ static void perf_dump_latency(
 
 	if (perf_end_flag)
 		count += snprintf(log + count, (size_t)(DUMP_BUF_LEN - count),
-			" page %d segment %d speed(bps) %lld threshold %llu",
+			" page %d segment %d speed(bps) %lld threshold %lu",
 			record->page_cnt, record->segment_cnt,
 			perf_calc_speed(record->page_cnt, total_time),
 			record->warning_threshold);
@@ -397,7 +386,7 @@ void hybridswap_perf_lat_stat(
 			atomic64_inc(&stat->fault_stat[task_is_fg].timeout_500ms_cnt);
 		else if (curr_lat > 100000)
 			atomic64_inc(&stat->fault_stat[task_is_fg].timeout_100ms_cnt);
-		log_info("task %s:%d fault out timeout us %llu fg %d\n",
+		log_info("task %s:%d fault out timeout us %lld fg %d\n",
 			current->comm, current->pid, curr_lat, task_is_fg);
 	}
 }
@@ -787,17 +776,17 @@ static inline ssize_t meminfo_show(struct hybridswap_stat *stat, char *buf, ssiz
 	zram_compressed = atomic64_read(&stat->zram_stored_size);
 	zram_used_pages = atomic64_read(&stat->zram_stored_pages);
 
-	size += scnprintf(buf + size, len - size, "%-32s %12llu KB\n",
+	size += scnprintf(buf + size, len - size, "%-32s %12lu KB\n",
 			"EST:", eswap_total_pages << (PAGE_SHIFT - 10));
-	size += scnprintf(buf + size, len - size, "%-32s %12llu KB\n",
+	size += scnprintf(buf + size, len - size, "%-32s %12lu KB\n",
 			"ESU_C:", eswap_compressed_pages << (PAGE_SHIFT - 10));
-	size += scnprintf(buf + size, len - size, "%-32s %12llu KB\n",
+	size += scnprintf(buf + size, len - size, "%-32s %12lu KB\n",
 			"ESU_O:", eswap_used_pages << (PAGE_SHIFT - 10));
-	size += scnprintf(buf + size, len - size, "%-32s %12llu KB\n",
+	size += scnprintf(buf + size, len - size, "%-32s %12lu KB\n",
 			"ZST:", zram_total_pags << (PAGE_SHIFT - 10));
-	size += scnprintf(buf + size, len - size, "%-32s %12llu KB\n",
+	size += scnprintf(buf + size, len - size, "%-32s %12lu KB\n",
 			"ZSU_C:", zram_compressed >> 10);
-	size += scnprintf(buf + size, len - size, "%-32s %12llu KB\n",
+	size += scnprintf(buf + size, len - size, "%-32s %12lu KB\n",
 			"ZSU_O:", zram_used_pages << (PAGE_SHIFT - 10));
 
 	return size;
@@ -1632,7 +1621,7 @@ struct hybridswap *alloc_hybridswap(unsigned long ori_size,
 		log_err("init ext list table failed\n");
 		goto err_out;
 	}
-	log_info("hs_swap %p size %lu nr_exts %lu nr_mcgs %lu nr_objs %lu\n",
+	log_info("hs_swap %p size %lu nr_exts %d nr_mcgs %d nr_objs %d\n",
 			hs_swap, hs_swap->size, hs_swap->nr_exts, hs_swap->nr_mcgs,
 			hs_swap->nr_objs);
 	log_info("hs_swap init OK.\n");
@@ -2355,73 +2344,53 @@ static void hybridswap_life_protect_ctrl_timer(struct timer_list *t)
 
 void hybridswap_close_bdev(struct block_device *bdev, struct file *backing_dev)
 {
-	if (bdev)
-		blkdev_put(bdev, FMODE_READ | FMODE_WRITE | FMODE_EXCL);
-
 	if (backing_dev)
 		filp_close(backing_dev, NULL);
 }
 
 struct file *hybridswap_open_bdev(const char *file_name)
 {
-	struct file *backing_dev = NULL;
+	struct file *backing_dev;
+	struct inode *inode;
 
-	backing_dev = filp_open(file_name, O_RDWR|O_LARGEFILE, 0);
-	if (unlikely(IS_ERR(backing_dev))) {
-		log_err("open the %s failed! eno = %lld\n",
-				file_name, PTR_ERR(backing_dev));
-		backing_dev = NULL;
+	backing_dev = filp_open_block(file_name, O_RDWR | O_LARGEFILE | O_EXCL, 0);
+	if (IS_ERR(backing_dev))
+		return NULL;
+
+	inode = backing_dev->f_mapping->host;
+	if (!S_ISBLK(inode->i_mode)) {
+		filp_close(backing_dev, NULL);
 		return NULL;
 	}
-
-	if (unlikely(!S_ISBLK(backing_dev->f_mapping->host->i_mode))) {
-		log_err("%s isn't a blk device\n", file_name);
-		hybridswap_close_bdev(NULL, backing_dev);
-		return NULL;
-	}
-
 	return backing_dev;
 }
 
 int hybridswap_bind(struct zram *zram, const char *file_name)
 {
-	struct file *backing_dev = NULL;
-	struct inode *inode = NULL;
+	struct file *backing_dev;
+	struct inode *inode;
+	struct block_device *bdev;
 	unsigned long nr_pages;
-	struct block_device *bdev = NULL;
 	int err;
 
 	backing_dev = hybridswap_open_bdev(file_name);
-	if (unlikely(!backing_dev))
+	if (!backing_dev)
 		return -EINVAL;
 
 	inode = backing_dev->f_mapping->host;
-	bdev = blkdev_get_by_dev(inode->i_rdev,
-			FMODE_READ | FMODE_WRITE | FMODE_EXCL, zram);
-	if (IS_ERR(bdev)) {
-		log_err("%s blkdev_get failed!\n", file_name);
-		err = PTR_ERR(bdev);
-		bdev = NULL;
-		goto out;
-	}
+	bdev = I_BDEV(inode);
+	nr_pages = i_size_read(inode) >> PAGE_SHIFT;
 
-	nr_pages = (unsigned long)i_size_read(inode) >> PAGE_SHIFT;
 	err = set_blocksize(backing_dev, PAGE_SIZE);
-	if (unlikely(err)) {
-		hybp(HS_LOG_ERR,
-				"%s set blocksize failed! eno = %d\n", file_name, err);
-		goto out;
+	if (err) {
+		filp_close(backing_dev, NULL);
+		return err;
 	}
 
 	zram->bdev = bdev;
 	zram->backing_dev = backing_dev;
 	zram->nr_pages = nr_pages;
 	return 0;
-
-out:
-	hybridswap_close_bdev(bdev, backing_dev);
-
-	return err;
 }
 
 static inline unsigned long get_original_used_swap(void)
@@ -2618,7 +2587,7 @@ ssize_t hybridswap_loop_device_store(struct device *dev,
 	int ret = 0;
 
 	if (len > (DEVICE_NAME_LEN - 1)) {
-		log_err("buf %s len %d is too long\n", buf, len);
+		log_err("buf %s len %zu is too long\n", buf, len);
 		return -EINVAL;
 	}
 
@@ -2704,7 +2673,7 @@ ssize_t hybridswap_quota_day_show(struct device *dev,
 {
 	int len = 0;
 
-	len = sprintf(buf, "%llu\n", hybridswap_quota_day());
+	len = sprintf(buf, "%lu\n", hybridswap_quota_day());
 
 	return len;
 }
@@ -4937,8 +4906,8 @@ out:
 	log_info("memcg %s %lu %lu reclaim_in %lu KB eswap %lu zram %lu %d\n",
 		hybs->name, require_size_before, require_size,
 		(require_size_before - require_size) >> 10,
-		atomic64_read(&hybs->hybridswap_stored_size),
-		atomic64_read(&hybs->zram_stored_size), ret);
+		(unsigned long)atomic64_read(&hybs->hybridswap_stored_size),
+		(unsigned long)atomic64_read(&hybs->zram_stored_size), ret);
 	return ret;
 }
 

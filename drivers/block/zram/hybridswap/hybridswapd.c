@@ -15,6 +15,7 @@
 #include <linux/device.h>
 #include <linux/cpuhotplug.h>
 #include <linux/cpumask.h>
+#include <linux/nodemask.h>
 #include <linux/suspend.h>
 #if IS_ENABLED(CONFIG_DRM_MSM) || IS_ENABLED(CONFIG_DRM_OPLUS_NOTIFY)
 #include <linux/msm_drm_notify.h>
@@ -28,6 +29,7 @@
 #include "internal.h"
 #include <linux/fd.h>
 #include <linux/file.h>
+MODULE_IMPORT_NS(MINIDUMP);
 
 enum swapd_pressure_level {
 	LEVEL_LOW = 0,
@@ -779,11 +781,18 @@ unsigned int system_cur_avail_buffers(void)
 	unsigned long pagecache;
 	unsigned long wmark_low = 0;
 	struct zone *zone;
+	int nid;
 
 	buffers = global_zone_page_state(NR_FREE_PAGES) - all_totalreserve_pages;
 
-	for_each_zone(zone)
-		wmark_low += low_wmark_pages(zone);
+	for_each_online_node(nid) {
+		struct pglist_data *pgdat = NODE_DATA(nid);
+		for (zone = pgdat->node_zones; zone < pgdat->node_zones + MAX_NR_ZONES; zone++) {
+			if (!populated_zone(zone))
+				continue;
+			wmark_low += low_wmark_pages(zone);
+		}
+	}
 	pagecache = global_node_page_state(NR_ACTIVE_FILE) +
 		global_node_page_state(NR_INACTIVE_FILE);
 	pagecache -= min(pagecache / 2, wmark_low);
