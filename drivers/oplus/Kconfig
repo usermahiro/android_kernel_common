@@ -13,6 +13,36 @@ config OPLUS_NANDSWAP
 	default y
 	help
 	  This option enables OPLUS nandswap feature for ColorOS RAM Expansion.
+	  Note: If CONFIG_HYBRIDSWAP or CONFIG_OPLUS_HYBRIDSWAP is enabled,
+	  Hybridswap takes priority and Nandswap is automatically disabled.
+
+config OPLUS_HYBRIDSWAP
+	bool "OPLUS Hybridswap support"
+	depends on ZRAM && MEMCG
+	select HYBRIDSWAP
+	select HYBRIDSWAP_SWAPD
+	select HYBRIDSWAP_CORE
+	default y
+	help
+	  This option enables native OPLUS Hybridswap memory expansion
+	  and management in ZRAM. When enabled, Hybridswap takes priority
+	  over Nandswap, and Nandswap is automatically disabled at runtime/init.
+
+	  If unsure, say Y.
+
+config OPLUS_ZSTDN
+	bool "OPLUS ZSTDN and ZSTDN_O fast compression support"
+	depends on ZRAM
+	select ZRAM_BACKEND_ZSTDN
+	default y
+	help
+	  This option enables the native OPlus Zstandard-N (zstdn and zstdn_o)
+	  fast compression algorithms specifically designed for ColorOS ZRAM.
+	  It optimizes the compression window to single 4KB page boundaries
+	  (windowLog=12) and applies negative-level match skipping to achieve
+	  near-LZ4 speed with superior Zstandard compression ratios.
+
+	  If unsure, say Y.
 
 config OPLUS_HEALTHINFO
 	bool "OPLUS healthinfo support"
@@ -76,6 +106,16 @@ config OPLUS_SHELL_TEMP
 	  located at /proc/shell-temp. It is required by the ColorOS horae
 	  thermal daemon (/system_ext/bin/horae) to monitor front, frame,
 	  and back skin temperature.
+
+	  If unsure, say Y.
+
+config OPLUS_CHARGER_COMPAT
+	bool "OPLUS universal fast charge and charger compatibility"
+	default y
+	help
+	  This option provides universal charger platform stubs (such as smart_charging)
+	  and intelligent input current compensation for ColorOS ported ROMs running on
+	  Linux 5.10 GKI kernels across MediaTek, Snapdragon, and universal platforms.
 
 	  If unsure, say Y.
 
