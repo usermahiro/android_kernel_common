@@ -574,6 +574,9 @@ void put_task_stack(struct task_struct *tsk)
 
 void free_task(struct task_struct *tsk)
 {
+#ifdef CONFIG_SCHED_BORE
+	bore_ctx_free(tsk);
+#endif
 #ifdef CONFIG_SECCOMP
 	WARN_ON_ONCE(tsk->seccomp.filter);
 #endif
@@ -2532,8 +2535,7 @@ __latent_entropy struct task_struct *copy_process(
 	p->start_boottime = ktime_get_boottime_ns();
 
 #ifdef CONFIG_SCHED_BORE
-	if (likely(p->pid))
-		task_fork_bore(p, current, clone_flags, p->start_time);
+	task_fork_bore(p, current, clone_flags, p->start_time);
 #endif /* CONFIG_SCHED_BORE */
 
 	/*

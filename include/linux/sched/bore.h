@@ -31,8 +31,10 @@ extern u64  bore_credit_ns(struct task_struct *p);
 DECLARE_STATIC_KEY_FALSE(sched_burst_protect_slice_cond_key);
 DECLARE_STATIC_KEY_FALSE(sched_burst_protect_slice_prefer_key);
 
+extern struct bore_ctx *bore_ctx(struct task_struct *p);
+
 static inline u8 bore_score(struct task_struct *p)
-{ return p->bore.penalty >> 8; }
+{ return bore_ctx(p)->penalty >> 8; }
 
 extern u8   effective_prio_bore(struct task_struct *p);
 extern void update_curr_bore(struct task_struct *p, u64 delta_exec);
@@ -42,6 +44,7 @@ extern void task_fork_bore(struct task_struct *p, struct task_struct *parent,
 													u64 clone_flags, u64 now);
 extern void sched_init_bore(void);
 extern void reset_task_bore(struct task_struct *p);
+extern void bore_ctx_free(struct task_struct *p);
 
 extern int  sched_bore_update_handler(const struct ctl_table *table,
 	int write, void __user *buffer, size_t *lenp, loff_t *ppos);

@@ -855,6 +855,9 @@ struct bore_ctx {
 	bool			futex_waiting;
 	struct bore_bc	subtree;
 	struct bore_bc	group;
+	struct hlist_node	node;
+	struct task_struct	*task;
+	struct rcu_head		rcu;
 };
 #endif /* CONFIG_SCHED_BORE */
 
@@ -918,9 +921,6 @@ struct task_struct {
 #ifdef CONFIG_SCHED_CLASS_EXT
 	struct sched_ext_entity		scx;
 #endif
-#ifdef CONFIG_SCHED_BORE
-	struct bore_ctx			bore;
-#endif /* CONFIG_SCHED_BORE */
 	const struct sched_class	*sched_class;
 
 #ifdef CONFIG_SCHED_CORE
