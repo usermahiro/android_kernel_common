@@ -161,3 +161,26 @@ config ZRAM_MULTI_COMP
 	  re-compress pages using a potentially slower but more effective
 	  compression algorithm. Note, that IDLE page recompression
 	  requires ZRAM_TRACK_ENTRY_ACTIME.
+
+config HYBRIDSWAP
+	bool "Enable Universal Hybridswap for Android GKI"
+	depends on MEMCG && ANDROID_VENDOR_HOOKS
+	select ANDROID_VENDOR_OEM_DATA
+	default n
+	help
+	  Universal Hybridswap tiered memory management and swap subsystem
+	  for Android Generic Kernel Image (GKI).
+
+config HYBRIDSWAP_SWAPD
+	bool "Enable hybridswap swapd thread"
+	default y
+	depends on HYBRIDSWAP
+	help
+	  Background reclaim daemon for anonymous pages.
+
+config HYBRIDSWAP_CORE
+	bool "Hybridswap container device support"
+	depends on HYBRIDSWAP
+	default y
+	help
+	  Use hybridswap as zram backend device.
