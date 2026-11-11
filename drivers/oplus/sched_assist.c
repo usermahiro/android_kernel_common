@@ -17,6 +17,7 @@
 #include <linux/cpufreq.h>
 #include <linux/pm_qos.h>
 #include <linux/timer.h>
+#include <linux/workqueue.h>
 #include <linux/jiffies.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
@@ -92,43 +93,90 @@ static const char *get_scene_name(int scene)
 	}
 }
 
+/*
+ * Boost targets are percentages of each policy's maximum frequency, not
+ * absolute kHz. Hardcoded kHz values above a small cluster's maximum used to
+ * clamp to policy->max, which made min == max and pinned that cluster at its
+ * highest frequency for the whole scene.
+ *
+ * The QoS request itself is applied from a workqueue: freq_qos_update_request()
+ * ends in blocking_notifier_call_chain(), which may sleep, so it cannot be
+ * called from the scene timer (softirq) or from a spinlocked section.
+ */
+static s32 qos_pending_boost[MAX_CPU_POLICIES];
+static struct work_struct qos_apply_work;
+static bool qos_work_queued;
+
+static unsigned int scene_boost_pct(int scene)
+{
+	switch (scene) {
+	case 1:  return 70;	/* APP_LAUNCH */
+	case 2:  return 55;	/* SLIDE_SCROLL */
+	case 3:  return 45;	/* ANIMATION_TOUCH */
+	case 4:  return 60;	/* CAMERA */
+	case 5:  return 65;	/* GAME */
+	default: return 0;
+	}
+}
+
+static void qos_apply_work_fn(struct work_struct *work)
+{
+	s32 boost[MAX_CPU_POLICIES];
+	int i, count;
+	unsigned long flags;
+
+	spin_lock_irqsave(&scene_lock, flags);
+	count = min(qos_count, MAX_CPU_POLICIES);
+	for (i = 0; i < count; i++)
+		boost[i] = qos_pending_boost[i];
+	qos_work_queued = false;
+	spin_unlock_irqrestore(&scene_lock, flags);
+
+	for (i = 0; i < count; i++) {
+		if (qos_controllers[i].active)
+			freq_qos_update_request(&qos_controllers[i].req, boost[i]);
+	}
+}
+
+/* Must be called with scene_lock held. */
 static void apply_cpu_qos_boost(int scene)
 {
+	unsigned int pct;
 	int i;
-	s32 target_freq_khz = 0;
 
 	if (disable_setting)
 		scene = 0;
 
-	switch (scene) {
-	case 1:
-		target_freq_khz = 1500000;
-		break;
-	case 2:
-		target_freq_khz = 1200000;
-		break;
-	case 3:
-		target_freq_khz = 1000000;
-		break;
-	case 4:
-		target_freq_khz = 1300000;
-		break;
-	case 5:
-		target_freq_khz = 1400000;
-		break;
-	default:
-		target_freq_khz = 0;
-		break;
-	}
+	pct = scene_boost_pct(scene);
 
 	for (i = 0; i < qos_count; i++) {
-		if (qos_controllers[i].active) {
-			s32 boost = target_freq_khz;
+		struct cpufreq_policy *policy = qos_controllers[i].policy;
+		unsigned long max;
+		s32 boost = 0;
 
-			if (boost > qos_controllers[i].policy->max)
-				boost = qos_controllers[i].policy->max;
-			freq_qos_update_request(&qos_controllers[i].req, boost);
+		if (!qos_controllers[i].active || !policy) {
+			qos_pending_boost[i] = 0;
+			continue;
 		}
+
+		max = READ_ONCE(policy->max);
+		if (pct && max)
+			boost = (s32)((u64)max * pct / 100);
+
+		/*
+		 * Never ask for the ceiling: min would follow max and stick.
+		 * A zero request releases the constraint; do not clamp it up
+		 * to policy->min, or the boost could never be undone.
+		 */
+		if (max && boost >= (s32)max)
+			boost = (s32)max - 1;
+
+		qos_pending_boost[i] = boost;
+	}
+
+	if (!qos_work_queued) {
+		qos_work_queued = true;
+		schedule_work(&qos_apply_work);
 	}
 }
 
@@ -1265,6 +1313,7 @@ static void cleanup_qos_controllers(void)
 static int __init oplus_sched_assist_init(void)
 {
 	timer_setup(&scene_watchdog, scene_watchdog_fn, 0);
+	INIT_WORK(&qos_apply_work, qos_apply_work_fn);
 	init_qos_controllers();
 
 	oplus_sched_dir = proc_mkdir("oplus_scheduler", NULL);
@@ -1328,6 +1377,7 @@ static void __exit oplus_sched_assist_exit(void)
 #endif
 
 	del_timer_sync(&scene_watchdog);
+	cancel_work_sync(&qos_apply_work);
 	cleanup_qos_controllers();
 
 	if (audio_dir) {
