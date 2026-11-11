@@ -92,6 +92,19 @@ bool zcomp_available_algorithm(const char *comp)
 	return lookup_backend_ops(comp) != NULL;
 }
 
+static int __init zcomp_show_backends(void)
+{
+	int i;
+
+	pr_info("zram: available compressors:");
+	for (i = 0; backends[i]; i++)
+		pr_cont(" %s", backends[i]->name);
+	pr_cont("\n");
+
+	return 0;
+}
+subsys_initcall(zcomp_show_backends);
+
 /* show available compressors */
 ssize_t zcomp_available_show(const char *comp, char *buf)
 {
@@ -230,6 +243,7 @@ struct zcomp *zcomp_create(const char *alg, struct zcomp_params *params)
 
 	comp->ops = lookup_backend_ops(alg);
 	if (!comp->ops) {
+		pr_err("zram: compressor '%s' is not available\n", alg);
 		kfree(comp);
 		return ERR_PTR(-EINVAL);
 	}

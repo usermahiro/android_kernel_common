@@ -35,6 +35,7 @@ config ZRAM_BACKEND_ZSTD
 config ZRAM_BACKEND_ZSTDN
 	bool "zstdn and zstdn_o compression support"
 	depends on ZRAM
+	default y
 	select ZSTD_COMPRESS
 	select ZSTD_DECOMPRESS
 
