@@ -855,8 +855,6 @@ struct bore_ctx {
 	bool			futex_waiting;
 	struct bore_bc	subtree;
 	struct bore_bc	group;
-	struct hlist_node	node;
-	struct task_struct	*task;
 	struct rcu_head		rcu;
 };
 #endif /* CONFIG_SCHED_BORE */
@@ -1683,7 +1681,15 @@ struct task_struct {
 	 */
 	struct callback_head		l1d_flush_kill;
 #endif
+#ifdef CONFIG_SCHED_BORE
+	/*
+	 * BORE per-task state. This reuses the first KABI reserve slot so the
+	 * layout (and therefore the KMI) of task_struct is unchanged.
+	 */
+	ANDROID_KABI_USE(1, void *bore_ctx_ptr);
+#else
 	ANDROID_KABI_RESERVE(1);
+#endif
 #ifdef CONFIG_ARM64_ERRATUM_4193714
 	ANDROID_KABI_USE(2, u64 __donotuse_b448672457);
 #else

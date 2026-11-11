@@ -1108,6 +1108,15 @@ static struct task_struct *dup_task_struct(struct task_struct *orig, int node)
 		return NULL;
 
 	err = arch_dup_task_struct(tsk, orig);
+#ifdef CONFIG_SCHED_BORE
+	/*
+	 * The BORE context belongs to the task, not to the copy. Clear it even
+	 * on the error path: free_task() would otherwise free the parent's
+	 * context, which *tsk = *orig just copied in. task_fork_bore()
+	 * allocates a fresh one.
+	 */
+	tsk->bore_ctx_ptr = NULL;
+#endif
 	if (err)
 		goto free_tsk;
 

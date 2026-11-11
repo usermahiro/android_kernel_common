@@ -34,7 +34,26 @@ DECLARE_STATIC_KEY_FALSE(sched_burst_protect_slice_prefer_key);
 extern struct bore_ctx *bore_ctx(struct task_struct *p);
 
 static inline u8 bore_score(struct task_struct *p)
-{ return bore_ctx(p)->penalty >> 8; }
+{
+	struct bore_ctx *ctx = bore_ctx(p);
+
+	return ctx ? ctx->penalty >> 8 : 0;
+}
+
+static inline bool bore_futex_waiting(struct task_struct *p)
+{
+	struct bore_ctx *ctx = bore_ctx(p);
+
+	return ctx && ctx->futex_waiting;
+}
+
+static inline void bore_set_futex_waiting(struct task_struct *p, bool waiting)
+{
+	struct bore_ctx *ctx = bore_ctx(p);
+
+	if (ctx)
+		ctx->futex_waiting = waiting;
+}
 
 extern u8   effective_prio_bore(struct task_struct *p);
 extern void update_curr_bore(struct task_struct *p, u64 delta_exec);

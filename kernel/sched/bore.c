@@ -5,7 +5,6 @@
 #include <linux/cpuset.h>
 #include <linux/sched/task.h>
 #include <linux/sched/bore.h>
-#include <linux/hashtable.h>
 #include <linux/slab.h>
 #include "sched.h"
 
@@ -34,33 +33,12 @@ static int __maybe_unused maxval_1_million = 1000000;
 
 static u32 bore_reciprocal_lut[BURST_CACHE_SAMPLE_LIMIT + 1];
 
-#define BORE_CTX_HASH_BITS 8
-static DEFINE_HASHTABLE(bore_ctx_ht, BORE_CTX_HASH_BITS);
-static DEFINE_SPINLOCK(bore_ctx_lock);
-static struct bore_ctx bore_ctx_fallback;
-
-static inline u32 bore_ctx_hash(struct task_struct *p)
-{
-	return hash_32((unsigned long)p >> 6, BORE_CTX_HASH_BITS);
-}
-
 struct bore_ctx *bore_ctx(struct task_struct *p)
 {
-	struct bore_ctx *ctx;
-
 	if (unlikely(!p))
-		return &bore_ctx_fallback;
+		return NULL;
 
-	rcu_read_lock();
-	hash_for_each_possible_rcu(bore_ctx_ht, ctx, node, bore_ctx_hash(p)) {
-		if (ctx->task == p) {
-			rcu_read_unlock();
-			return ctx;
-		}
-	}
-	rcu_read_unlock();
-
-	return &bore_ctx_fallback;
+	return READ_ONCE(p->bore_ctx_ptr);
 }
 
 static struct bore_ctx *bore_ctx_alloc(struct task_struct *p)
@@ -70,28 +48,19 @@ static struct bore_ctx *bore_ctx_alloc(struct task_struct *p)
 	if (!ctx)
 		return NULL;
 
-	ctx->task = p;
-	spin_lock(&bore_ctx_lock);
-	hash_add_rcu(bore_ctx_ht, &ctx->node, bore_ctx_hash(p));
-	spin_unlock(&bore_ctx_lock);
-
+	WRITE_ONCE(p->bore_ctx_ptr, ctx);
 	return ctx;
 }
 
 void bore_ctx_free(struct task_struct *p)
 {
-	struct bore_ctx *ctx;
+	struct bore_ctx *ctx = READ_ONCE(p->bore_ctx_ptr);
 
-	spin_lock(&bore_ctx_lock);
-	hash_for_each_possible(bore_ctx_ht, ctx, node, bore_ctx_hash(p)) {
-		if (ctx->task == p) {
-			hash_del_rcu(&ctx->node);
-			spin_unlock(&bore_ctx_lock);
-			kfree_rcu(ctx, rcu);
-			return;
-		}
-	}
-	spin_unlock(&bore_ctx_lock);
+	if (!ctx)
+		return;
+
+	WRITE_ONCE(p->bore_ctx_ptr, NULL);
+	kfree_rcu(ctx, rcu);
 }
 
 DEFINE_STATIC_KEY_TRUE(sched_burst_inherit_key);
@@ -110,7 +79,10 @@ static inline u32 log2p1_u64_u32fp(u64 v, u8 fp) {
 
 void bore_note_sleep(struct task_struct *p, u64 now)
 {
-	bore_ctx(p)->credit_sleep = now;
+	struct bore_ctx *ctx = bore_ctx(p);
+
+	if (ctx)
+		ctx->credit_sleep = now;
 }
 
 u64 bore_credit_ns(struct task_struct *p)
@@ -118,6 +90,9 @@ u64 bore_credit_ns(struct task_struct *p)
 	struct bore_ctx *ctx = bore_ctx(p);
 	u64 cap = (u64)sched_credit_cap_us * 1000ULL;
 	u64 slept = 0, credit = 0;
+
+	if (!ctx)
+		return 0;
 
 	if (ctx->credit_sleep) {
 		slept = rq_clock(task_rq(p)) - ctx->credit_sleep;
@@ -166,9 +141,11 @@ static void reweight_task_by_prio(struct task_struct *p, int prio) {
 	if (se->on_rq) {
 		struct bore_ctx *ctx = bore_ctx(p);
 
-		ctx->stop_update = true;
+		if (ctx)
+			ctx->stop_update = true;
 		reweight_entity(cfs_rq_of(se), se, weight);
-		ctx->stop_update = false;
+		if (ctx)
+			ctx->stop_update = false;
 	} else
 		se->load.weight = weight;
 	se->load.inv_weight = sched_prio_to_wmult[prio];
@@ -187,6 +164,8 @@ u8 effective_prio_bore(struct task_struct *p) {
 static void update_penalty(struct task_struct *p) {
 	struct bore_ctx *ctx = bore_ctx(p);
 
+	if (!ctx) return;
+
 	u8  prev_prio = effective_prio_bore(p);
 
 	s32 diff = (s32)ctx->curr_penalty - (s32)ctx->prev_penalty;
@@ -201,7 +180,7 @@ static void update_penalty(struct task_struct *p) {
 
 void update_curr_bore(struct task_struct *p, u64 delta_exec) {
 	struct bore_ctx *ctx = bore_ctx(p);
-	if (ctx->stop_update) return;
+	if (!ctx || ctx->stop_update) return;
 
 	ctx->burst_time += delta_exec;
 	u32 curr_penalty = ctx->curr_penalty = calc_burst_penalty(ctx->burst_time);
@@ -212,7 +191,11 @@ void update_curr_bore(struct task_struct *p, u64 delta_exec) {
 
 void restart_burst_bore(struct task_struct *p) {
 	struct bore_ctx *ctx = bore_ctx(p);
-	u32 new_penalty = binary_smooth(ctx->curr_penalty, ctx->prev_penalty);
+	u32 new_penalty;
+
+	if (!ctx) return;
+
+	new_penalty = binary_smooth(ctx->curr_penalty, ctx->prev_penalty);
 	ctx->prev_penalty = new_penalty;
 	ctx->curr_penalty = 0;
 	ctx->burst_time = 0;
@@ -263,11 +246,12 @@ static inline bool burst_cache_expired(struct bore_bc *bc, u64 now) {
 
 static void update_burst_cache(struct bore_bc *bc,
 		struct task_struct *p, u32 count, u32 total, u64 now) {
+	struct bore_ctx *ctx = bore_ctx(p);
 	u32 average = (count == 1) ? total :
 		(u32)(((u64)total * bore_reciprocal_lut[count]) >> 32);
 
 	struct bore_bc new_bc = {
-		.penalty = max(average, bore_ctx(p)->penalty),
+		.penalty = max(average, ctx ? ctx->penalty : 0),
 		.timestamp = now >> BORE_BC_TIMESTAMP_SHIFT
 	};
 	WRITE_ONCE(bc->value, new_bc.value);
@@ -280,18 +264,24 @@ static u32 inherit_from_parent(struct task_struct *parent,
 	if (clone_flags & CLONE_PARENT)
 		parent = rcu_dereference(parent->real_parent);
 
-	struct bore_bc *bc = &bore_ctx(parent)->subtree;
+	struct bore_ctx *parent_ctx = bore_ctx(parent);
+	if (!parent_ctx) return 0;
+	struct bore_bc *bc = &parent_ctx->subtree;
 
 	if (burst_cache_expired(bc, now)) {
 		struct task_struct *child;
 		u32 count = 0, total = 0, scan_count = 0;
 		for_each_child_task(parent, child) {
+			struct bore_ctx *child_ctx;
+
 			if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
 			if (scan_count++ >= BURST_CACHE_SCAN_LIMIT) break;
 
 			if (!task_is_bore_eligible(child)) continue;
+			child_ctx = bore_ctx(child);
+			if (!child_ctx) continue;
 			count++;
-			total += bore_ctx(child)->penalty;
+			total += child_ctx->penalty;
 		}
 
 		update_burst_cache(bc, parent, count, total, now);
@@ -317,12 +307,16 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent,
 			count_children_upto2(ancestor) <= sole_child_count;
 			ancestor = next, sole_child_count = 1) {}
 
-	struct bore_bc *bc = &bore_ctx(ancestor)->subtree;
+	struct bore_ctx *ancestor_ctx = bore_ctx(ancestor);
+	if (!ancestor_ctx) return 0;
+	struct bore_bc *bc = &ancestor_ctx->subtree;
 
 	if (burst_cache_expired(bc, now)) {
 		struct task_struct *direct_child;
 		u32 count = 0, total = 0, scan_count = 0;
 		for_each_child_task(ancestor, direct_child) {
+			struct bore_ctx *desc_ctx;
+
 			if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
 			if (scan_count++ >= BURST_CACHE_SCAN_LIMIT) break;
 
@@ -336,8 +330,10 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent,
 			}
 
 			if (!task_is_bore_eligible(descendant)) continue;
+			desc_ctx = bore_ctx(descendant);
+			if (!desc_ctx) continue;
 			count++;
-			total += bore_ctx(descendant)->penalty;
+			total += desc_ctx->penalty;
 		}
 
 		update_burst_cache(bc, ancestor, count, total, now);
@@ -350,19 +346,25 @@ static u32 inherit_from_ancestor_hub(struct task_struct *parent,
 static u32 inherit_from_thread_group(struct task_struct *p, u64 now) {
 	struct bore_bc bc_val;
 	struct task_struct *leader = p->group_leader;
-	struct bore_bc *bc = &bore_ctx(leader)->group;
+	struct bore_ctx *leader_ctx = bore_ctx(leader);
+	if (!leader_ctx) return 0;
+	struct bore_bc *bc = &leader_ctx->group;
 
 	if (burst_cache_expired(bc, now)) {
 		struct task_struct *sibling;
 		u32 count = 0, total = 0, scan_count = 0;
 
 		for_each_thread(leader, sibling) {
+			struct bore_ctx *sibling_ctx;
+
 			if (count >= BURST_CACHE_SAMPLE_LIMIT) break;
 			if (scan_count++ >= BURST_CACHE_SCAN_LIMIT) break;
 
 			if (!task_is_bore_eligible(sibling)) continue;
+			sibling_ctx = bore_ctx(sibling);
+			if (!sibling_ctx) continue;
 			count++;
-			total += bore_ctx(sibling)->penalty;
+			total += sibling_ctx->penalty;
 		}
 
 		update_burst_cache(bc, leader, count, total, now);
@@ -374,11 +376,12 @@ static u32 inherit_from_thread_group(struct task_struct *p, u64 now) {
 
 void task_fork_bore(struct task_struct *p,
 	               struct task_struct *parent, u64 clone_flags, u64 now) {
-	bore_ctx_alloc(p);
+	struct bore_ctx *ctx = bore_ctx_alloc(p);
+
+	if (!ctx) return;
 	if (!static_branch_likely(&sched_bore_key) || !task_is_bore_eligible(p)) return;
 
 	rcu_read_lock();
-	struct bore_ctx *ctx = bore_ctx(p);
 	u32 inherited_penalty;
 	if (clone_flags & CLONE_THREAD)
 		inherited_penalty = inherit_from_thread_group(parent, now);
@@ -401,7 +404,12 @@ void task_fork_bore(struct task_struct *p,
 }
 
 void reset_task_bore(struct task_struct *p)
-{ memset(bore_ctx(p), 0, offsetof(struct bore_ctx, node)); }
+{
+	struct bore_ctx *ctx = bore_ctx(p);
+
+	if (ctx)
+		memset(ctx, 0, sizeof(*ctx));
+}
 
 static void update_inherit_type(void) {
 	switch(sched_burst_inherit_type) {

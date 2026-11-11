@@ -376,12 +376,12 @@ void futex_wait_queue(struct futex_hash_bucket *hb, struct futex_q *q,
 		 */
 		if (!timeout || timeout->task) {
 #ifdef CONFIG_SCHED_BORE
-			bore_ctx(current)->futex_waiting = true;
+			bore_set_futex_waiting(current, true);
 #endif /* CONFIG_SCHED_BORE */
 			trace_android_vh_futex_sleep_start(current);
 			schedule();
 #ifdef CONFIG_SCHED_BORE
-			bore_ctx(current)->futex_waiting = false;
+			bore_set_futex_waiting(current, false);
 #endif /* CONFIG_SCHED_BORE */
 		}
 	}
