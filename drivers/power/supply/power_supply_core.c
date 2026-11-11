@@ -1337,8 +1337,9 @@ EXPORT_SYMBOL_GPL(power_supply_set_property);
 int power_supply_property_is_writeable(struct power_supply *psy,
 					enum power_supply_property psp)
 {
-	if (psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT ||
-	    psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX)
+	if ((psp == POWER_SUPPLY_PROP_INPUT_CURRENT_LIMIT ||
+	     psp == POWER_SUPPLY_PROP_CONSTANT_CHARGE_CURRENT_MAX) &&
+	    psy->desc->set_property)
 		return 1;
 
 	if (!psy->desc->property_is_writeable)
