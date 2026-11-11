@@ -36,6 +36,9 @@ MODULE_IMPORT_NS(MINIDUMP);
 #define BIO_MAX_PAGES 256
 #endif
 
+#define HYBRIDSWAP_UNTRACK_WAIT_US 50
+#define HYBRIDSWAP_UNTRACK_WAIT_TRIES 100
+
 #define HS_LIST_PTR_SHIFT 23
 #define HS_LIST_MCG_SHIFT_HALF 8
 #define HS_LIST_LOCK_BIT HS_LIST_MCG_SHIFT_HALF
@@ -2599,16 +2602,19 @@ ssize_t hybridswap_loop_device_store(struct device *dev,
 	down_write(&zram->init_lock);
 	if (zram->disksize == 0) {
 		log_err("disksize is 0\n");
+		ret = -EINVAL;
 		goto out;
 	}
 
 	ret = hybridswap_core_init(zram);
-	if (ret)
-		log_err("core_init init failed\n");
+	if (ret) {
+		log_err("core_init init failed: %d\n", ret);
+		goto out;
+	}
 
 out:
 	up_write(&zram->init_lock);
-	return len;
+	return ret ? ret : (ssize_t)len;
 }
 
 ssize_t hybridswap_loop_device_show(struct device *dev,
@@ -4563,7 +4569,11 @@ void hybridswap_track(struct zram *zram, u32 index,
 
 	hybs = MEMCGRP_ITEM_DATA(memcg);
 	if (!hybs) {
-		hybs = hybridswap_cache_alloc(memcg, false);
+		/*
+		 * hybridswap_track() runs under the zram slot spinlock, so the
+		 * allocation must not sleep.
+		 */
+		hybs = hybridswap_cache_alloc(memcg, true);
 		if (!hybs) {
 			stat = hybridswap_get_stat_obj();
 			if (stat)
@@ -4591,13 +4601,23 @@ void hybridswap_track(struct zram *zram, u32 index,
 
 void hybridswap_untrack(struct zram *zram, u32 index)
 {
+	int tries = 0;
+
 	if (!hybridswap_core_enabled())
 		return;
 
+	/*
+	 * Writeback holds these flags. Waiting here is on the page free path,
+	 * so bound the spin: a stalled writeback must not burn a CPU forever.
+	 */
 	while (zram_test_flag(zram, index, ZRAM_UNDER_WB) ||
 			zram_test_flag(zram, index, ZRAM_BATCHING_OUT)) {
+		if (++tries > HYBRIDSWAP_UNTRACK_WAIT_TRIES) {
+			log_warn("untrack timeout, index %u still busy\n", index);
+			return;
+		}
 		zram_slot_unlock(zram, index);
-		udelay(50);
+		udelay(HYBRIDSWAP_UNTRACK_WAIT_US);
 		zram_slot_lock(zram, index);
 	}
 

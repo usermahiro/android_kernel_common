@@ -171,8 +171,13 @@ memcg_hybs_t *hybridswap_cache_alloc(struct mem_cgroup *memcg, bool atomic)
 	u64 ret;
 	gfp_t flags = GFP_KERNEL;
 
-	if (memcg->android_oem_data1[0])
-		BUG();
+	/*
+	 * Two CPUs can reach here for the same memcg; the cmpxchg below
+	 * serialises them, so a plain read here must not be fatal.
+	 */
+	ret = atomic64_read((atomic64_t *)&memcg->android_oem_data1[0]);
+	if (ret)
+		return (memcg_hybs_t *)ret;
 
 	if (atomic)
 		flags &= ~__GFP_DIRECT_RECLAIM;
@@ -228,8 +233,8 @@ static void tune_scan_type_hook(void *data, enum scan_balance *scan_balance)
 
 static void mem_cgroup_alloc_hook(void *data, struct mem_cgroup *memcg)
 {
-	if (memcg->android_oem_data1[0])
-		BUG();
+	if (WARN_ON_ONCE(memcg->android_oem_data1[0]))
+		return;
 
 	hybridswap_cache_alloc(memcg, true);
 }
@@ -903,6 +908,59 @@ ssize_t hybridswap_enable_store(struct device *dev,
 	return ret;
 }
 
+/*
+ * The legacy and default hierarchies need separate cftype arrays: the cgroup
+ * core writes ss/kf_ops/flags into every entry it registers, so the same array
+ * cannot be handed to cgroup_add_dfl_cftypes() after cgroup_add_legacy_cftypes().
+ * Android runs the memory controller on cgroup v2, so without the default
+ * hierarchy registration none of the per-memcg knobs ever appear.
+ */
+static struct cftype *hybridswap_dup_cftypes(const struct cftype *src)
+{
+	size_t nr = 0, i;
+	struct cftype *copy;
+
+	while (src[nr].name[0] != '\0')
+		nr++;
+
+	copy = kmemdup(src, (nr + 1) * sizeof(*src), GFP_KERNEL);
+	if (!copy)
+		return NULL;
+
+	for (i = 0; i < nr; i++) {
+		/*
+		 * Drop the bookkeeping and hierarchy bits the cgroup core added
+		 * to the original array; cgroup_init_cftypes() rejects a cftype
+		 * that still carries __CFTYPE_ADDED, and both hierarchy flags at
+		 * once would hide the file from every hierarchy.
+		 */
+		copy[i].flags &= ~(__CFTYPE_ONLY_ON_DFL |
+				   __CFTYPE_NOT_ON_DFL | __CFTYPE_ADDED);
+		copy[i].ss = NULL;
+		copy[i].kf_ops = NULL;
+		INIT_LIST_HEAD(&copy[i].node);
+	}
+
+	return copy;
+}
+
+static int hybridswap_add_dfl_cftypes(const struct cftype *src, const char *what)
+{
+	struct cftype *copy = hybridswap_dup_cftypes(src);
+	int ret;
+
+	if (!copy) {
+		log_err("dup %s cftypes failed\n", what);
+		return -ENOMEM;
+	}
+
+	ret = cgroup_add_dfl_cftypes(&memory_cgrp_subsys, copy);
+	if (ret)
+		log_err("add %s dfl cftypes failed: %d\n", what, ret);
+
+	return ret;
+}
+
 int __init hybridswap_pre_init(void)
 {
 	int ret;
@@ -926,6 +984,13 @@ int __init hybridswap_pre_init(void)
 		goto error_out;
 	}
 
+	/*
+	 * Best effort: the legacy hierarchy may not even exist on this device,
+	 * and hybridswap must still come up for the swap core to work.
+	 */
+	hybridswap_add_dfl_cftypes(mem_cgroup_hybridswap_legacy_files,
+			"hybridswap");
+
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
 	ret = cgroup_add_legacy_cftypes(&memory_cgrp_subsys,
 			mem_cgroup_swapd_legacy_files);
@@ -933,6 +998,8 @@ int __init hybridswap_pre_init(void)
 		log_info("add mem_cgroup_swapd_legacy_files failed!\n");
 		goto error_out;
 	}
+
+	hybridswap_add_dfl_cftypes(mem_cgroup_swapd_legacy_files, "swapd");
 #endif
 
 #ifdef CONFIG_HYBRIDSWAP_SWAPD
